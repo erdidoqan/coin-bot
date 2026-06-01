@@ -1,0 +1,7 @@
+BINANCE_API_KEY=your_api_key
+BINANCE_API_SECRET=your_api_secret
+TRIGGER_SECRET=coin-bot-trigger-2026
+
+# Opsiyonel: sabit IP forward proxy (Worker → VPS/VPN)
+# BINANCE_PROXY_URL=https://YOUR_HOST:8788
+# BINANCE_PROXY_SECRET=uzun-rastgele-proxy-secret

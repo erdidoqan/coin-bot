@@ -1,0 +1,33 @@
+{
+  "name": "coin-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "build:admin": "cd admin && npm install && npm run build && cd .. && node scripts/copy-admin.mjs",
+    "deploy": "npm run build:admin && wrangler deploy",
+    "types": "wrangler types",
+    "db:migrate:local": "wrangler d1 migrations apply coin-bot-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply coin-bot-db --remote",
+    "check": "wrangler check",
+    "simulate:exit": "node scripts/simulate-tiered-exit.mjs",
+    "test:continuation": "npx tsx scripts/continuation-momentum.test.mjs",
+    "test:micro-scalp": "npx tsx scripts/micro-scalp.test.mjs",
+    "test:micro-shadow": "npx tsx scripts/micro-shadow.test.mjs",
+    "test:market-data-do": "npx tsx scripts/market-data-do.test.mjs",
+    "test:tick-scalp": "npx tsx scripts/tick-scalp.test.mjs",
+    "test:tick-reversal": "npx tsx scripts/tick-reversal.test.mjs",
+    "test:tick-fire-debounce": "npx tsx scripts/tick-fire-debounce.test.mjs",
+    "test:grid-market-downturn": "npx tsx scripts/grid-market-downturn.test.mjs",
+    "test:grid-readiness": "npx tsx scripts/grid-readiness.test.mjs"
+  },
+  "dependencies": {
+    "bignumber.js": "^9.3.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250525.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.19.0"
+  }
+}

@@ -1,0 +1,51 @@
+name = "coin-bot"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+account_id = "0f6cb9b6c5fb3a6db6781f0dc9f36844"
+workers_dev = true
+
+[observability]
+enabled = true
+
+# custom_domain = true → Cloudflare DNS + SSL kaydını otomatik oluşturur
+[[routes]]
+pattern = "coin.digitexa.com"
+custom_domain = true
+
+[triggers]
+crons = ["*/15 * * * *", "* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "coin-bot-db"
+database_id = "c7879135-a10f-43a6-b0c1-a68fe65664da"
+migrations_dir = "migrations"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/admin/api/*", "/trigger", "/internal/*"]
+
+[[durable_objects.bindings]]
+name = "MARKET_DATA"
+class_name = "MarketDataDO"
+
+[[migrations]]
+tag = "v1-market-data-do"
+new_classes = ["MarketDataDO"]
+
+[[migrations]]
+tag = "v2-spread-monitor-do"
+new_classes = ["SpreadMonitorDO"]
+
+[[migrations]]
+tag = "v3-remove-spread-monitor-do"
+deleted_classes = ["SpreadMonitorDO"]
+
+[vars]
+# false = gerçek emir yok (dry-run). Trailing fix sonrası bilinçli true yapın.
+TRADING_ENABLED = "true"
+BINANCE_BASE_URL = "https://api.binance.com"
+WORKER_PUBLIC_URL = "https://coin.digitexa.com"
+# Dry-run trailing: fiyat düşmezse bu süre sonra simüle satış (dakika)
+MOCK_MAX_HOLD_MINUTES = "240"
