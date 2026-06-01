@@ -784,7 +784,7 @@ export class MarketDataDO extends DurableObject<Env> {
     }
   }
 
-  /** WS ticker arr low/high eksikse scanner (Dip Watch) çalışmaz — REST ile doldur. */
+  /** WS ticker arr low/high eksikse 24s aralık güvenilmez — REST ile doldur. */
   private tickersMissing24hRange(): boolean {
     let checked = 0;
     let missing = 0;

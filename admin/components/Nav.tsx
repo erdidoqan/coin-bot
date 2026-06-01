@@ -9,7 +9,6 @@ const links = [
   { href: '/', label: 'Dashboard' },
   { href: '/binance-pnl/', label: 'Binance PnL' },
   { href: '/market-data/', label: 'Market verisi' },
-  { href: '/dip-watch/', label: 'Dip Watch' },
   { href: '/logs/', label: 'Olaylar' },
   { href: '/config/', label: 'Ayarlar' },
   { href: '/actions/', label: 'Aksiyonlar' },

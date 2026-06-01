@@ -76,7 +76,6 @@ export default {
               'grid-sweep',
               'dust-convert',
               'grid-recover-active',
-              'dip-watch-refresh',
               'all',
             ],
           },

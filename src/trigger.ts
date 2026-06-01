@@ -6,7 +6,6 @@ import { runGridMaintenance, recoverAllActiveGrids, forceRecenterGrid } from './
 import { runGridScout } from './jobs/grid-scout';
 import { runGridSweep } from './jobs/grid-sweep';
 import { runDustConvert } from './jobs/dust-convert';
-import { runDipWatchRefresh } from './jobs/dip-watch-refresh';
 import { getBotState } from './db/bot-state';
 import { isTickScalpEnabled, getConfig } from './db/bot-config';
 import { countOpenPositions } from './db/open-positions';
@@ -22,7 +21,6 @@ export type ManualJob =
   | 'dust-convert'
   | 'grid-recover-active'
   | 'grid-recenter'
-  | 'dip-watch-refresh'
   | 'all';
 
 async function isGridEnabled(env: Env): Promise<boolean> {
@@ -34,7 +32,6 @@ async function isGridEnabled(env: Env): Promise<boolean> {
  * sembolle çalışır, watchlist/DO'ya ihtiyacı yok. Her iki cron da grid bakımına gider.
  */
 export async function runScheduled(env: Env, cron: string): Promise<void> {
-  await runDipWatchRefresh(env);
   if (await isGridEnabled(env)) {
     // 15-dk: aday seç + DO'ya ver (WS izleme). 1-dk: grid bakımı + readiness'li giriş.
     if (cron === '*/15 * * * *') {
@@ -135,9 +132,6 @@ export async function runManualJob(env: Env, job: ManualJob): Promise<void> {
       await runGridMaintenance(env);
       break;
     }
-    case 'dip-watch-refresh':
-      await runDipWatchRefresh(env);
-      break;
     case 'all':
       await runScout(env);
       await runSniperOrReconcile(env);
@@ -157,7 +151,6 @@ export function parseManualJob(value: string | null): ManualJob | null {
     'dust-convert',
     'grid-recover-active',
     'grid-recenter',
-    'dip-watch-refresh',
     'all',
   ];
   return jobs.includes(value as ManualJob) ? (value as ManualJob) : null;

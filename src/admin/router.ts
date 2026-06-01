@@ -40,12 +40,6 @@ import {
   fetchFloatingPnlForStateLight,
 } from './floating-pnl';
 import { fetchRotationStatus } from './rotation-status';
-import {
-  buildDipWatchHistoryReport,
-  buildDipWatchReport,
-  handleDipWatchAddSymbol,
-  handleDipWatchRemoveSymbol,
-} from './dip-watch';
 import { jsonResponse, optionsResponse } from './cors';
 
 const CONFIG_KEYS: BotConfigKey[] = [
@@ -303,48 +297,6 @@ export async function handleAdminApi(request: Request, env: Env): Promise<Respon
         available: Boolean(env.MARKET_DATA),
         status,
       });
-    }
-
-    if (path === '/dip-watch' && request.method === 'GET') {
-      const report = await buildDipWatchReport(env);
-      return jsonResponse(request, report);
-    }
-
-    if (path === '/dip-watch/history' && request.method === 'GET') {
-      const symbol = url.searchParams.get('symbol')?.trim() || undefined;
-      const limit = Number(url.searchParams.get('limit') ?? '50');
-      const report = await buildDipWatchHistoryReport(env, { symbol, limit });
-      return jsonResponse(request, report);
-    }
-
-    if (path === '/dip-watch/symbols' && request.method === 'POST') {
-      let body: { symbol?: string };
-      try {
-        body = (await request.json()) as { symbol?: string };
-      } catch {
-        return jsonResponse(request, { error: 'invalid_json' }, 400);
-      }
-      const symbol = body.symbol?.trim();
-      if (!symbol) {
-        return jsonResponse(request, { error: 'symbol required' }, 400);
-      }
-      const result = await handleDipWatchAddSymbol(env, symbol);
-      if (!result.ok) {
-        return jsonResponse(request, { error: result.error }, 400);
-      }
-      return jsonResponse(request, result.report);
-    }
-
-    if (path === '/dip-watch/symbols' && request.method === 'DELETE') {
-      const symbol = url.searchParams.get('symbol')?.trim();
-      if (!symbol) {
-        return jsonResponse(request, { error: 'symbol query required' }, 400);
-      }
-      const result = await handleDipWatchRemoveSymbol(env, symbol);
-      if (!result.ok) {
-        return jsonResponse(request, { error: result.error }, 400);
-      }
-      return jsonResponse(request, result.report);
     }
 
     if (path === '/tick-live' && request.method === 'GET') {

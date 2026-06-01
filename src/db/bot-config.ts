@@ -206,18 +206,6 @@ export type BotConfigKey =
   | 'grid_market_downturn_allow_manual'
   | 'grid_market_downturn_force_active'
   | 'grid_run_lock'
-  | 'dip_watch_max_position_pct'
-  | 'dip_watch_scan_pool_size'
-  | 'dip_watch_max_tracked'
-  | 'dip_watch_min_quote_volume_usdt'
-  | 'dip_watch_quality_enabled'
-  | 'dip_watch_min_listing_days'
-  | 'dip_watch_max_spread_pct'
-  | 'dip_watch_depth_band_pct'
-  | 'dip_watch_min_depth_quote_usdt'
-  | 'dip_watch_max_vol_mcap_ratio'
-  | 'dip_watch_min_circulating_supply_pct'
-  | 'dip_watch_max_fdv_to_mcap_ratio'
 
 const ENV_FALLBACK: Partial<Record<BotConfigKey, keyof Env>> = {
   hard_stop_loss_pct: 'HARD_STOP_LOSS_PCT',
@@ -433,18 +421,6 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   grid_market_downturn_allow_manual: 'false',
   grid_market_downturn_force_active: 'false',
   grid_run_lock: '0',
-  dip_watch_max_position_pct: '5',
-  dip_watch_scan_pool_size: '80',
-  dip_watch_max_tracked: '30',
-  dip_watch_min_quote_volume_usdt: '500000',
-  dip_watch_quality_enabled: 'true',
-  dip_watch_min_listing_days: '30',
-  dip_watch_max_spread_pct: '0.25',
-  dip_watch_depth_band_pct: '2',
-  dip_watch_min_depth_quote_usdt: '25000',
-  dip_watch_max_vol_mcap_ratio: '1.2',
-  dip_watch_min_circulating_supply_pct: '20',
-  dip_watch_max_fdv_to_mcap_ratio: '5',
 };
 
 export async function getConfig(

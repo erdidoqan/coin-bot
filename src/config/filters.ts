@@ -13,20 +13,6 @@ const STABLE_BASES = new Set([
   'USD1',
   'USDE',
 ]);
-
-/** ~1 USD peg (USDT quote) — Dip Watch / scanner'da anlamlı dip yok */
-export const PEGGED_USD_BASES = new Set([
-  ...STABLE_BASES,
-  'U', // UUSDT
-  'XUSD',
-  'EURI',
-  'USDT', // edge: wrapped if any
-]);
-
-export function isPeggedUsdUsdtSymbol(symbol: string): boolean {
-  if (!symbol.endsWith('USDT')) return false;
-  return PEGGED_USD_BASES.has(symbol.slice(0, -4));
-}
 const LEVERAGED_SUFFIX = /(UP|DOWN|BEAR|BULL)$/i;
 
 export const MIN_QUOTE_VOLUME = 5_000_000;
