@@ -45,6 +45,10 @@ const BLOCKERS: Record<string, { label: string; hint: string }> = {
     label: 'Şimdi düşüyor',
     hint: 'Son birkaç 5 dk mum üst üste kırmızı veya kısa sürede belirgin düşüş.',
   },
+  pct_3m_decline: {
+    label: 'Son 3 dk düşüş',
+    hint: 'Güncel fiyat, ~3 dk önceki 1m kapanışın altında; skor −1, hazır sayılmaz.',
+  },
   entry_band_position: {
     label: 'Band üstünde',
     hint: 'Fiyat auto-range üst yarısında; breakeven_dip için alış çok yukarıda kalır.',
@@ -54,8 +58,8 @@ const BLOCKERS: Record<string, { label: string; hint: string }> = {
     hint: 'Son ~3 saatte (36×5m) net getiri eşiğin altında; düşen bıçakta kurulum yok.',
   },
   hour_decline: {
-    label: '1 saat sürekli düşüş',
-    hint: 'Son 12×5m kapanış üst üste kırmızı; watchlist ve aday listesine alınmaz.',
+    label: '~40 dk sürekli düşüş',
+    hint: 'Son 8×5m kapanış üst üste kırmızı; watchlist ve aday listesine alınmaz.',
   },
   post_exit_cooldown: {
     label: 'Çıkış sonrası bekleme',
@@ -80,6 +84,10 @@ const BLOCKERS: Record<string, { label: string; hint: string }> = {
   force_active: {
     label: 'Manuel düşüş kilidi',
     hint: 'grid_market_downturn_force_active=true; eşiklerden bağımsız yeni grid kapalı.',
+  },
+  defensive_mode: {
+    label: 'Savunma modu',
+    hint: 'Chop / düşüş / manuel kilit: yeni grid yok; muaf olmayan aktifler recovery.',
   },
   market_downturn_weak_symbol: {
     label: 'Zayıf 24s coin',

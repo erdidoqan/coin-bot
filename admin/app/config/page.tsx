@@ -158,6 +158,10 @@ const GROUPS: Group[] = [
       },
       { key: 'grid_max_inventory_usdt', label: 'Envanter (bag) tavanı (USDT)' },
       {
+        key: 'grid_setup_market_entry',
+        label: 'Kurulumda market alım (true = investment/grid_count tek seferde)',
+      },
+      {
         key: 'grid_ladder_mode',
         label: 'Merdiven modu: breakeven_dip (tek alış + ort çıkış) | classic',
       },

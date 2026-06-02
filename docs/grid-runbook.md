@@ -52,6 +52,7 @@ trend envanteri (bag) → motorda stop-out + range-reset + envanter guard var.
 | `grid_floor_exit_margin_pct` | 0.5 | breakeven_dip çıkış LIMIT: ortalama maliyet + bu % |
 | `grid_dip_buy_defer_steps` | 1 | breakeven_dip: 0=hemen limit alış; N=fiyat hedefin N basamak üstüne inince koy (USDT kilidi yok). Fiyat serbest bırakma eşiğinin üstüne çıkınca açık alış iptal. |
 | `grid_max_consecutive_buys` | 2 | classic mod: eşzamanlı açık alış tavanı |
+| `grid_setup_market_entry` | false | true: kurulumda `investment_usdt / grid_count` tutarında **MARKET** alım (taker); ardından breakeven_dip → floor SELL, classic → üst seviye SELL + alt limitler |
 | `grid_flash_drop_enabled` | true | ani düşüş koruması |
 | `grid_flash_drop_warn_pct` | 2.0 | uyarı: yeni alış/heal/recenter durur |
 | `grid_flash_drop_pause_pct` | 3.0 | açık alışlar iptal |
@@ -69,7 +70,7 @@ trend envanteri (bag) → motorda stop-out + range-reset + envanter guard var.
 | `grid_min_atr_pct` | 0.25 | aday: min ATR% (yeterli hareket) |
 | `grid_max_range_width_pct` | 18 | aday: max 24s aralık % |
 | `grid_readiness_max_spread_pct` | 0.10 | aday: max spread % |
-| `grid_readiness_momentum_warn_pct` | 3.0 | aday: kısa düşüş eşiği % (flash uyarısından ayrı) |
+| `grid_readiness_momentum_warn_pct` | 2.0 | aday: kısa düşüş eşiği % (3×5m net &lt; −eşik → şimdi düşüyor) |
 | `grid_readiness_max_path_range_ratio` | 12 | aday: max path/range kapanış span (0=kapalı) |
 | `grid_readiness_max_bar_range_path_ratio` | 18 | aday: max Σ(H−L)/span — fitilli mumlar |
 | `grid_readiness_max_stability_range_pct` | 28 | aday: 24s pencerede max (H−L)/mid % |
@@ -97,6 +98,8 @@ Ek scout kuralları (tabloda satır bazlı veya üst banner):
 
 `grid_flash_drop_enabled=false` iken flash kapısı her zaman geçer; momentum `grid_readiness_downside_bars=0` ile kapatılabilir.
 
+**Aktif grid (cycle sonrası):** `GRID_CYCLE` (satış doldu) sonrası readiness yeniden hesaplanır. `ready=false` ise yeni alış konmaz (`GRID_CYCLE_READINESS_HOLD`); `grid_readiness_teardown_enabled` ile flat grid kapatılır (`GRID_TEARDOWN`, `not_ready_teardown`). Paneldeki **Hazır** (= tüm kapılar) ile aynı `readiness.ready` bayrağı.
+
 ### Grid scout ön filtresi (watchlist)
 
 15 dk `runGridScout`: önce hacim top `N × grid_scout_pool_multiplier`, sonra (açıksa):
@@ -123,7 +126,22 @@ Düşüş modu aktifken scout ek filtresi: 24s `priceChangePercent` &lt; `grid_m
 | panic | breadth ≤35% + BTC ATR | Tek başına kilit (`market_panic`) |
 | breadth_weak | watchlist breadth ≤38% | BTC 24s ≤−2,5% **veya** BTC 15m EMA9&lt;EMA21 ve 4 bar getiri ≤−0,8% ile birlikte (`market_downturn`) |
 
-Açık gridler: flash/recovery/süpürme **devam**. Log: `GRID_MARKET_DOWNTURN` (geçiş), `GRID_WAIT` (`market_downturn` / `market_panic`).
+Açık gridler (düşüş modu tek başına): flash/recovery/süpürme **devam**. Log: `GRID_MARKET_DOWNTURN` (geçiş), `GRID_WAIT` (`market_downturn` / `market_panic`).
+
+### Savunma modu (`grid_defensive_mode_enabled`)
+
+Tetik: **chop** veya **panic** rejimi, **piyasa düşüş kapısı** aktif, veya **`grid_market_downturn_force_active`** (downturn kapalı olsa bile).
+
+| Davranış | Açıklama |
+|----------|----------|
+| Yeni grid | `GRID_WAIT` `reason=defensive_mode` — kurulum yok |
+| Aktif grid (muaf değil) | Envanter → `enterRecovery` (`defensive_mode`); flat → emir iptal + stop |
+| Recovery (muaf değil) | `lastPrice <= target × (1 − stop%)` → MARKET USDT (`defensive_stop_loss`) |
+| Muaf gridler | `grid_defensive_exempt_grid_ids` — teardown/stop yok |
+
+Varsayılan stop: `grid_defensive_recovery_stop_pct=1.0` (hedef LIMIT fiyatının %1 altı).
+
+Config: migration `0074_grid_defensive_mode.sql`.
 
 Config: `grid_market_downturn_*` (migration `0065_grid_market_downturn.sql`).
 
@@ -137,7 +155,7 @@ Kurulumdan **önce** aday uygunlukta ek kapılar (`finalizeCandidateReadiness`):
 | `medium_downside` | `medium_return_bars` / `warn_pct` | 36 / 2.5 | ~3s net düşüş (GENIUS tipi) |
 | `post_exit_cooldown` | `post_exit_cooldown_*` | 45 dk | Floor veya STOP sonrası aynı coine hemen grid yok |
 | `post_exit_relax` | `post_exit_relax_enabled` | **false** | Çıkış sonrası gevşetme kapalı (churn önleme) |
-| `hour_decline` | `hour_decline_bars` | 12 | Son 1s (12×5m) üst üste kırmızı → scout watchlist dışı, aday tablosunda görünmez |
+| `hour_decline` | `hour_decline_bars` | 8 | Son ~40 dk (8×5m) üst üste kırmızı → scout watchlist dışı, aday tablosunda görünmez |
 
 Deploy sonrası kalibrasyon (1–2 hafta):
 
@@ -169,6 +187,7 @@ WHERE event_type='GRID_MARKET_DOWNTURN' ORDER BY created_at DESC LIMIT 50;
 - `npx tsx scripts/grid-flash-drop.test.mjs` — flash guard + scout helper.
 - `npx tsx scripts/grid-readiness-flash.test.mjs` — aday momentum + birleşik ready.
 - `npx tsx scripts/grid-recovery-isolation.test.mjs` — recovery qty cap + setup exclude.
+- `npx tsx scripts/recovery-ladder.test.mjs` — kademeli kurtarma movePct, boyutlar, done set.
 - `npx tsx scripts/grid-market-downturn.test.mjs` — piyasa düşüş modu eşikleri + scout zayıf coin.
 
 ### D1 migration (prod)
@@ -180,6 +199,25 @@ npm run deploy
 ```
 
 **Recovery izolasyonu:** `enterRecovery` satış miktarı = `min(grid FILLED alış−satış, cüzdan free)`; `recovery_qty` kilitlenir. Paralel yeni grid ayrı `grid_id` ve `grid_orders`. `GRID_RECOVERY_OPENED` → `trackedRemaining`, `free`, `sellQty`.
+
+## Kademeli kurtarma (manuel ladder)
+
+Kurtarma tablosunda **Kademeli** butonu: 10 adımlık manuel panel (otomatik tetikleme yok).
+
+- **Anchor:** `recovery_avg_cost` (ort. maliyet).
+- **Alım:** pozisyon değerinin %10 / %25 → `MARKET` al, ardından recovery `LIMIT_MAKER` yeniden kurulur.
+- **Satış:** `recovery_qty`'nin %10–%40 kısmı `MARKET`; %100 → `convertRecoveryToUsdt` (tümünü sat).
+- **Tut adımları** (−5%, +5%, +15%): işlem yok; `recovery_ladder_done` JSON'a yazılır.
+- **Savunma modu** (`defensive_stop_loss` vb.) ayrı çalışır; kademeli API savunmayı kapatmaz.
+
+API: `GET/POST /admin/api/grid-recovery-ladder` (`gridId`, `stepId`). Log: `GRID_RECOVERY_LADDER`, `GRID_RECOVERY_LADDER_FAILED`.
+
+**Otomasyon:** `grid_recovery_ladder_auto_enabled=true` (varsayılan) iken `maintainRecovery` her turda eşiği geçmiş ilk tamamlanmamış adımı uygular (tur başına 1 adım). Manuel panel hâlâ erken/isteğe bağlı adım için kullanılır. Kapatmak: config `false`. Log: `GRID_RECOVERY_LADDER_AUTO`, `GRID_RECOVERY_LADDER_AUTO_SKIP`.
+
+```bash
+npx wrangler d1 execute coin-bot --remote --file=migrations/0075_recovery_ladder.sql
+npx tsx scripts/recovery-ladder.test.mjs
+```
 
 ## Sonraki adımlar (bu pas dışı)
 

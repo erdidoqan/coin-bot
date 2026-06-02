@@ -589,3 +589,44 @@ export function finalizeCandidateReadiness(input: FinalizeCandidateInput): Final
     downsideBlocked,
   };
 }
+
+/** DO 1m: ref = klines[length - 1 - barsAgo].close */
+export function rollingReturnPct(
+  lastPrice: number | null,
+  klines: Array<{ close: number | string }> | null,
+  barsAgo: number,
+): number | null {
+  if (lastPrice == null || !(lastPrice > 0) || !klines || barsAgo < 1) return null;
+  const refIdx = klines.length - 1 - barsAgo;
+  if (refIdx < 0) return null;
+  const ref = Number(klines[refIdx]!.close);
+  if (!(ref > 0)) return null;
+  return Number((((lastPrice - ref) / ref) * 100).toFixed(2));
+}
+
+/** Son 3 dk getiri negatifse hazır değil, skor −1, ek kapı. */
+export function applyPriceChangePct3mPenalty(
+  readiness: GridReadinessResult,
+  priceChangePct3m: number | null,
+): GridReadinessResult {
+  if (priceChangePct3m == null || priceChangePct3m >= 0) return readiness;
+
+  const gates: GridReadinessGate[] = [
+    ...readiness.gates,
+    {
+      id: 'pct_3m_decline',
+      label: 'Son 3 dk getiri pozitif',
+      pass: false,
+      actual: priceChangePct3m,
+      threshold: '>= 0%',
+    },
+  ];
+
+  return {
+    ...readiness,
+    ready: false,
+    score: Number((readiness.score - 1).toFixed(2)),
+    gates,
+    primaryBlocker: readiness.primaryBlocker ?? 'pct_3m_decline',
+  };
+}

@@ -110,10 +110,6 @@ export function evaluateGridMarketDownturn(input: {
     ema9Above21,
   };
 
-  if (!input.enabled) {
-    return { active: false, reasons: [], metrics, regime: input.regime };
-  }
-
   if (input.forceActive) {
     return {
       active: true,
@@ -121,6 +117,10 @@ export function evaluateGridMarketDownturn(input: {
       metrics,
       regime: input.regime,
     };
+  }
+
+  if (!input.enabled) {
+    return { active: false, reasons: [], metrics, regime: input.regime };
   }
 
   const reasons: string[] = [];
@@ -238,8 +238,18 @@ export async function blockSetupForMarketDownturn(
   watchlistSymbols: string[],
   opts?: { manualMode?: boolean },
 ): Promise<boolean> {
-  if (!cfg.marketDownturnEnabled) return false;
   if (opts?.manualMode && cfg.marketDownturnAllowManual) return false;
+
+  if (cfg.marketDownturnForceActive) {
+    await logEvent(env.DB, 'GRID_WAIT', {
+      reason: 'force_active',
+      reasons: ['force_active'],
+      manualLock: true,
+    });
+    return true;
+  }
+
+  if (!cfg.marketDownturnEnabled) return false;
 
   const downturn = await resolveGridMarketDownturn(env, client, cfg, watchlistSymbols);
   await syncGridMarketDownturnObservability(env.DB, downturn);

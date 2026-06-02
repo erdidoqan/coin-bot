@@ -8,6 +8,7 @@ import {
   downsideMomentumBlocked,
   downsideMomentumBlockedRelaxed,
   finalizeCandidateReadiness,
+  applyPriceChangePct3mPenalty,
   rangePositionPct,
   entryBandTooHigh,
   mediumDownsideBlocked,
@@ -270,6 +271,28 @@ t('finalizeCandidateReadiness: hour_decline engeli', () => {
   });
   assert.equal(merged.readiness.primaryBlocker, 'hour_decline');
   assert.equal(merged.readiness.ready, false);
+});
+
+t('applyPriceChangePct3mPenalty: negatif 3dk hazır değil skor -1', () => {
+  const closes = [];
+  for (let i = 0; i < 30; i++) {
+    const c = 100 + Math.sin(i / 3) * 2;
+    closes.push(c);
+  }
+  const klines = closes.map((c) => ({ high: c + 0.8, low: c - 0.8, close: c }));
+  const base = evaluateGridReadiness({
+    klines,
+    lastPrice: closes[closes.length - 1],
+    spreadPct: 0.02,
+    config: cfgNoStability(),
+  });
+  assert.equal(base.ready, true);
+  const penalized = applyPriceChangePct3mPenalty(base, -0.04);
+  assert.equal(penalized.ready, false);
+  assert.equal(penalized.score, Number((base.score - 1).toFixed(2)));
+  assert.equal(penalized.primaryBlocker, 'pct_3m_decline');
+  assert.ok(penalized.gates.some((g) => g.id === 'pct_3m_decline' && !g.pass));
+  assert.equal(applyPriceChangePct3mPenalty(base, 0.1), base);
 });
 
 t('isPostExitCooldownActive: floor sonrası bekleme', () => {

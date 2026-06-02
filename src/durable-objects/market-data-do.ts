@@ -288,36 +288,20 @@ export class MarketDataDO extends DurableObject<Env> {
       });
     }
 
-    if (url.pathname === '/book') {
-      const symbol = url.searchParams.get('symbol')?.toUpperCase();
-      if (!symbol) return Response.json({ error: 'symbol required' }, { status: 400 });
-      const m = this.obMetrics.get(symbol);
-      if (m && m.bestBid > 0 && m.bestAsk > 0) {
-        const mid = (m.bestBid + m.bestAsk) / 2;
-        return Response.json({
-          symbol,
-          mid: String(mid),
-          spreadPct: m.spreadPct,
-          bid: m.bestBid,
-          ask: m.bestAsk,
-          source: 'depth',
-        });
+    if (url.pathname === '/book' || url.pathname === '/books') {
+      const multi = url.pathname === '/books';
+      const symbolsParam = url.searchParams.get('symbols');
+      const symbols = multi
+        ? (symbolsParam?.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean) ?? [])
+        : url.searchParams.get('symbol')
+          ? [url.searchParams.get('symbol')!.toUpperCase()]
+          : [];
+      if (symbols.length === 0) {
+        return Response.json({ error: multi ? 'symbols required' : 'symbol required' }, { status: 400 });
       }
-      const ticker = this.tickers.get(symbol);
-      if (ticker?.lastPrice && Number(ticker.lastPrice) > 0) {
-        return Response.json({
-          symbol,
-          mid: ticker.lastPrice,
-          spreadPct: m?.spreadPct ?? null,
-          source: 'ticker',
-        });
-      }
-      const k1 = this.klines.getForScoring(symbol, '1m', 1);
-      const lastK = k1[k1.length - 1];
-      if (lastK && Number(lastK.close) > 0) {
-        return Response.json({ symbol, mid: lastK.close, spreadPct: null, source: 'kline_1m' });
-      }
-      return Response.json({ symbol, mid: null, spreadPct: null, source: null });
+      const books = symbols.map((symbol) => this.resolveBookQuote(symbol));
+      if (multi) return Response.json({ books });
+      return Response.json(books[0]!);
     }
 
     if (url.pathname === '/score') {
@@ -526,17 +510,72 @@ export class MarketDataDO extends DurableObject<Env> {
     const bid = Number(d.b);
     const ask = Number(d.a);
     if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return;
-    const mid = ((bid + ask) / 2).toFixed(8);
+    const midN = (bid + ask) / 2;
+    const mid = midN.toFixed(8);
+    const now = Date.now();
+    const spreadPct = midN > 0 ? ((ask - bid) / midN) * 100 : 0;
+    const prevOb = this.obMetrics.get(sym);
+    this.obMetrics.set(sym, {
+      bidAskRatio: prevOb?.bidAskRatio ?? 1,
+      spreadPct,
+      spreadPctPrev: prevOb?.spreadPct ?? null,
+      spreadHistory: [...(prevOb?.spreadHistory ?? []), spreadPct].slice(-5),
+      bidAskRatioAtTrough: prevOb?.bidAskRatioAtTrough ?? null,
+      persistenceScore: prevOb?.persistenceScore ?? 0,
+      updatedAt: now,
+      topBidWall: prevOb?.topBidWall ?? null,
+      bestBid: bid,
+      bestAsk: ask,
+    });
     const prev = this.tickers.get(sym);
     this.tickers.set(
       sym,
       mergeTicker24h(prev, { symbol: sym, lastPrice: mid }),
     );
-    this.tickerUpdatedAt = Date.now();
+    this.tickerUpdatedAt = now;
     if (this.symbols.includes(sym)) {
-      this.recordMidSample(sym, Number(mid));
+      this.recordMidSample(sym, midN);
       this.maybeScheduleTickEval(sym);
     }
+  }
+
+  /** bookTicker > taze depth > ticker > 1m kline */
+  private resolveBookQuote(symbol: string): {
+    symbol: string;
+    mid: string | null;
+    spreadPct: number | null;
+    bid?: number;
+    ask?: number;
+    source: string | null;
+  } {
+    const m = this.obMetrics.get(symbol);
+    const now = Date.now();
+    if (m && m.bestBid > 0 && m.bestAsk > 0 && now - m.updatedAt <= 5_000) {
+      const mid = (m.bestBid + m.bestAsk) / 2;
+      return {
+        symbol,
+        mid: String(mid),
+        spreadPct: m.spreadPct,
+        bid: m.bestBid,
+        ask: m.bestAsk,
+        source: 'book',
+      };
+    }
+    const ticker = this.tickers.get(symbol);
+    if (ticker?.lastPrice && Number(ticker.lastPrice) > 0) {
+      return {
+        symbol,
+        mid: ticker.lastPrice,
+        spreadPct: m?.spreadPct ?? null,
+        source: 'ticker',
+      };
+    }
+    const k1 = this.klines.getForScoring(symbol, '1m', 1);
+    const lastK = k1[k1.length - 1];
+    if (lastK && Number(lastK.close) > 0) {
+      return { symbol, mid: lastK.close, spreadPct: null, source: 'kline_1m' };
+    }
+    return { symbol, mid: null, spreadPct: null, source: null };
   }
 
   private recordMidSample(symbol: string, mid: number): void {

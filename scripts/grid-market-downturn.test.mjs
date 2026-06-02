@@ -49,6 +49,19 @@ t('disabled → inactive', () => {
   assert.equal(r.active, false);
 });
 
+t('disabled + force_active → active (manuel kilit)', () => {
+  const r = evaluateGridMarketDownturn({
+    enabled: false,
+    forceActive: true,
+    regime: baseRegime,
+    btcKlines15m: klinesFromCloses([100, 100, 100, 100, 100]),
+    btc24hChangePct: 5,
+    thresholds: th,
+  });
+  assert.equal(r.active, true);
+  assert.ok(r.reasons.includes('force_active'));
+});
+
 t('panic regime → active', () => {
   const r = evaluateGridMarketDownturn({
     enabled: true,

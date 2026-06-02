@@ -9,9 +9,13 @@ import {
   type GridDashboard,
   type GridCandidateRow,
   type GridMarketGate,
+  type GridRegimeSummary,
   type GridLadderLevel,
   type GridStatusReport,
+  type GridStatusLivePatch,
   type GridRecoveryRow,
+  type RecoveryLadderState,
+  type RecoveryLadderStep,
   type OrphanReport,
   type OrphanBalanceRow,
 } from '@/lib/api';
@@ -55,34 +59,75 @@ export default function DashboardPage() {
   const [data, setData] = useState<GridDashboard | null>(null);
   const [candidates, setCandidates] = useState<GridCandidateRow[] | null>(null);
   const [marketGate, setMarketGate] = useState<GridMarketGate | null>(null);
+  const [regimeSummary, setRegimeSummary] = useState<GridRegimeSummary | null>(null);
   const [orphans, setOrphans] = useState<OrphanReport | null>(null);
   const [error, setError] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState('');
   const [convertingId, setConvertingId] = useState<number | null>(null);
+  const [ladderOpenId, setLadderOpenId] = useState<number | null>(null);
+  const [ladderBusyId, setLadderBusyId] = useState<number | null>(null);
+  const [ladderState, setLadderState] = useState<RecoveryLadderState | null>(null);
+  const [ladderLoading, setLadderLoading] = useState(false);
   const [cancelingId, setCancelingId] = useState<number | null>(null);
   const [forceBusy, setForceBusy] = useState(false);
+
+  const applyGridLive = useCallback((patches: GridStatusLivePatch[]) => {
+    if (patches.length === 0) return;
+    setData((prev) => {
+      if (!prev) return prev;
+      const byId = new Map(patches.map((p) => [p.gridId, p]));
+      return {
+        ...prev,
+        grids: prev.grids.map((g) => {
+          if (g.gridId == null) return g;
+          const p = byId.get(g.gridId);
+          if (!p || p.lastPrice == null) return g;
+          const unrealized =
+            g.inventoryAvgCost != null && g.inventoryAvgCost > 0
+              ? Number(
+                  (((p.lastPrice - g.inventoryAvgCost) / g.inventoryAvgCost) * 100).toFixed(2),
+                )
+              : g.inventoryUnrealizedPct;
+          return {
+            ...g,
+            lastPrice: p.lastPrice,
+            rangeStatus: p.rangeStatus ?? g.rangeStatus,
+            inventoryUnrealizedPct: unrealized,
+          };
+        }),
+      };
+    });
+  }, []);
+
+  const loadCandidates = useCallback(
+    async (opts?: { live?: boolean; updateMarketGate?: boolean }) => {
+      const q = opts?.live ? '?live=1' : '';
+      const c = await apiFetch<{
+        candidates: GridCandidateRow[];
+        marketGate: GridMarketGate;
+        regimeSummary: GridRegimeSummary;
+      }>(`/admin/api/grid-candidates${q}`);
+      setCandidates(c.candidates);
+      // Canlı poll da regime_cache kapısını döner; banner ile tablo senkron kalsın.
+      setMarketGate(c.marketGate);
+      setRegimeSummary(c.regimeSummary);
+    },
+    [],
+  );
 
   const load = useCallback(async () => {
     // Çekirdek dashboard (hızlı) — adaylar + öksüzler ayrı/progressive.
     const d = await apiFetch<GridDashboard>('/admin/api/grid-dashboard');
     setData(d);
     setError('');
-    // Adaylar (yavaş: REST kline fallback) arka planda yüklenir, çekirdeği bloklamaz.
-    apiFetch<{ candidates: GridCandidateRow[]; marketGate: GridMarketGate }>(
-      '/admin/api/grid-candidates',
-    )
-      .then((c) => {
-        setCandidates(c.candidates);
-        setMarketGate(c.marketGate);
-      })
-      .catch(() => {});
+    void loadCandidates({ updateMarketGate: true }).catch(() => {});
     // Öksüz bakiyeler (myTrades çağrıları) ayrı yüklenir.
     apiFetch<OrphanReport>('/admin/api/grid-orphans')
       .then((o) => setOrphans(o))
       .catch(() => {});
-  }, []);
+  }, [loadCandidates]);
 
   const runAction = useCallback(
     async (job: 'grid-sweep' | 'dust-convert', label: string) => {
@@ -186,6 +231,80 @@ export default function DashboardPage() {
     [load],
   );
 
+  const loadLadderState = useCallback(async (gridId: number) => {
+    setLadderLoading(true);
+    setError('');
+    try {
+      const state = await apiFetch<RecoveryLadderState>(
+        `/admin/api/grid-recovery-ladder?gridId=${gridId}`,
+      );
+      setLadderState(state);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Kademeli durum yüklenemedi');
+      setLadderOpenId(null);
+      setLadderState(null);
+    } finally {
+      setLadderLoading(false);
+    }
+  }, []);
+
+  const toggleLadder = useCallback(
+    async (row: GridRecoveryRow) => {
+      if (ladderOpenId === row.gridId) {
+        setLadderOpenId(null);
+        setLadderState(null);
+        return;
+      }
+      setLadderOpenId(row.gridId);
+      setLadderState(null);
+      await loadLadderState(row.gridId);
+    },
+    [ladderOpenId, loadLadderState],
+  );
+
+  const executeLadderStep = useCallback(
+    async (step: RecoveryLadderStep) => {
+      if (!ladderState) return;
+      const sym = ladderState.symbol.replace('USDT', '');
+      const warn = !step.suggested && ladderState.movePct != null;
+      let msg = `${sym}: "${step.label}" uygulansın mı?`;
+      if (warn) {
+        msg += `\n\nŞu an anchor'a göre ${signed(ladderState.movePct ?? 0, 2)}% — eşik ${step.thresholdPct > 0 ? '+' : ''}${step.thresholdPct}% henüz geçilmemiş olabilir. Yine de devam?`;
+      }
+      if (!window.confirm(msg)) return;
+
+      setLadderBusyId(ladderState.gridId);
+      setError('');
+      try {
+        const res = await apiFetch<{
+          ok: boolean;
+          message: string;
+          state?: RecoveryLadderState;
+        }>('/admin/api/grid-recovery-ladder', {
+          method: 'POST',
+          body: JSON.stringify({ gridId: ladderState.gridId, stepId: step.id }),
+        });
+        if (!res.ok) {
+          setError(res.message || 'Adım başarısız');
+          return;
+        }
+        if (res.state) {
+          setLadderState(res.state);
+        } else {
+          setLadderOpenId(null);
+          setLadderState(null);
+        }
+        setActionMsg(`${sym}: kademeli adım "${step.label}" tamamlandı`);
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Kademeli adım hatası');
+      } finally {
+        setLadderBusyId(null);
+      }
+    },
+    [ladderState, load],
+  );
+
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
@@ -202,6 +321,52 @@ export default function DashboardPage() {
     const t = setInterval(() => load().catch(() => {}), 15_000);
     return () => clearInterval(t);
   }, [load]);
+
+  // Aktif pozisyonlar: DO bookTicker mid (~1 sn); emir/ladder/flash tam dashboard (15 sn).
+  useEffect(() => {
+    const GRID_LIVE_MS = 1_000;
+    let cancelled = false;
+    let inFlight = false;
+    const tickGrids = () => {
+      if (cancelled || document.visibilityState === 'hidden' || inFlight) return;
+      inFlight = true;
+      apiFetch<{ grids: GridStatusLivePatch[] }>('/admin/api/grid-live')
+        .then((r) => applyGridLive(r.grids))
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    tickGrids();
+    const gridIv = setInterval(tickGrids, GRID_LIVE_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(gridIv);
+    };
+  }, [applyGridLive]);
+
+  // Aday uygunluk: DO fiyat/spread ~1 sn; tam regime REST ~30 sn (canlıda regime_cache kapısı).
+  useEffect(() => {
+    const LIVE_MS = 1_000;
+    const MARKET_MS = 30_000;
+    let cancelled = false;
+    const tickLive = () => {
+      if (cancelled || document.visibilityState === 'hidden') return;
+      loadCandidates({ live: true }).catch(() => {});
+    };
+    const tickMarket = () => {
+      if (cancelled || document.visibilityState === 'hidden') return;
+      loadCandidates({ live: false }).catch(() => {});
+    };
+    tickLive();
+    const liveIv = setInterval(tickLive, LIVE_MS);
+    const marketIv = setInterval(tickMarket, MARKET_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(liveIv);
+      clearInterval(marketIv);
+    };
+  }, [loadCandidates]);
 
   const live = data?.tradingEnabled === 'true' && data?.liveGate;
   const grids = data?.grids ?? [];
@@ -239,7 +404,7 @@ export default function DashboardPage() {
   return (
     <AuthGuard>
       <Nav />
-      <main className="mx-auto max-w-6xl px-4 py-4 sm:py-6">
+      <main className="mx-auto max-w-6xl px-3 py-4 sm:px-4 sm:py-6">
         {error && <p className="mb-4 text-red-400">{error}</p>}
         {actionMsg && <p className="mb-4 text-xs text-amber-300">{actionMsg}</p>}
         {!data && !error && <p className="text-slate-400">Yükleniyor…</p>}
@@ -275,7 +440,12 @@ export default function DashboardPage() {
             </div>
 
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-medium">Aktif Pozisyonlar ({grids.length})</h2>
+              <div>
+                <h2 className="text-lg font-medium">Aktif Pozisyonlar ({grids.length})</h2>
+                <p className="mt-0.5 text-[11px] text-slate-500">
+                  Fiyat / aralık / unrealized ~1 sn (bookTicker); emirler, ladder, flash ~15 sn
+                </p>
+              </div>
               <button
                 type="button"
                 onClick={() => refresh()}
@@ -336,8 +506,17 @@ export default function DashboardPage() {
                         <RecoveryRow
                           key={r.gridId}
                           r={r}
-                          busy={convertingId === r.gridId}
+                          busy={
+                            convertingId === r.gridId ||
+                            ladderBusyId === r.gridId ||
+                            (ladderOpenId === r.gridId && ladderLoading)
+                          }
                           onConvert={convertRecovery}
+                          ladderOpen={ladderOpenId === r.gridId}
+                          ladderState={ladderOpenId === r.gridId ? ladderState : null}
+                          ladderLoading={ladderOpenId === r.gridId && ladderLoading}
+                          onToggleLadder={() => toggleLadder(r)}
+                          onExecuteStep={executeLadderStep}
                         />
                       ))}
                     </tbody>
@@ -355,103 +534,141 @@ export default function DashboardPage() {
               onDust={() => runAction('dust-convert', 'Dust → BNB')}
             />
 
-            <section className="rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-3">
+            <section className="rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-3 sm:px-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="flex w-full items-center justify-between gap-3 sm:hidden">
+                  <h2 className="text-sm font-medium text-slate-200">Piyasa kilidi</h2>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span
+                      className={`text-xs font-medium ${forceActive ? 'text-red-300' : 'text-slate-400'}`}
+                    >
+                      {forceBusy ? '…' : forceActive ? 'Kilitli' : 'Serbest'}
+                    </span>
+                    <ToggleForceDownturn
+                      forceActive={forceActive}
+                      forceBusy={forceBusy}
+                      onToggle={() => void toggleForceDownturn()}
+                    />
+                  </div>
+                </div>
                 <div className="min-w-0 flex-1">
-                  <h2 className="text-sm font-medium text-slate-200">
+                  <h2 className="hidden text-sm font-medium text-slate-200 sm:block">
                     Piyasa düşüş kilidi (manuel)
                   </h2>
-                  <p className="mt-1 text-xs text-slate-500">
-                    Açıkken eşiklere bakılmadan yeni grid kurulmaz. Kapalıyken yalnızca otomatik
-                    panic/breadth/BTC kuralları devreye girer.
+                  <p className="mt-0 text-xs leading-relaxed text-slate-500 sm:mt-1">
+                    Açıkken bot yeni grid kurmaz. Kapalıyken chop / otomatik düşüş eşikleri geçerli
+                    olabilir.
                   </p>
-                  {marketGate && (
-                    <p className="mt-2 text-xs text-slate-400">
-                      Otomatik kapı:{' '}
-                      <span className={autoDownturnActive ? 'text-red-300' : 'text-slate-300'}>
-                        {autoDownturnActive ? 'aktif' : 'pasif'}
+                  <ul className="mt-2 space-y-1 text-xs text-slate-400">
+                    <li className="flex flex-wrap gap-x-1">
+                      <span className="text-slate-500">Manuel kilit:</span>
+                      <span className={forceActive ? 'text-red-300' : 'text-slate-300'}>
+                        {forceActive ? 'aktif' : 'kapalı'}
                       </span>
-                      {autoDownturnActive && marketGate.reasons.length > 0 && (
-                        <span className="text-slate-500">
-                          {' '}
-                          ({marketGate.reasons.join(', ')} · breadth {marketGate.breadthPct}%
-                          {marketGate.btc24hChangePct != null
-                            ? ` · BTC 24s ${marketGate.btc24hChangePct.toFixed(2)}%`
-                            : ''}
-                          )
+                    </li>
+                    {marketGate && (
+                      <li className="flex flex-wrap gap-x-1">
+                        <span className="text-slate-500">Otomatik düşüş:</span>
+                        <span className={autoDownturnActive ? 'text-red-300' : 'text-slate-300'}>
+                          {autoDownturnActive ? 'aktif' : 'pasif'}
                         </span>
-                      )}
-                    </p>
-                  )}
+                      </li>
+                    )}
+                    {autoDownturnActive && marketGate && marketGate.reasons.length > 0 && (
+                      <li className="text-[11px] leading-snug text-slate-500">
+                        {marketGate.reasons.filter((r) => r !== 'force_active').join(', ') ||
+                          'eşikler'}
+                        {marketGate.breadthPct ? ` · breadth ${marketGate.breadthPct}%` : ''}
+                        {marketGate.btc24hChangePct != null
+                          ? ` · BTC 24s ${marketGate.btc24hChangePct.toFixed(2)}%`
+                          : ''}
+                      </li>
+                    )}
+                  </ul>
                 </div>
-                <div className="flex shrink-0 items-center gap-3">
+                <div className="hidden shrink-0 items-center gap-3 sm:flex">
                   <span
                     className={`text-xs font-medium ${forceActive ? 'text-red-300' : 'text-slate-400'}`}
                   >
                     {forceBusy ? '…' : forceActive ? 'Kilitli' : 'Serbest'}
                   </span>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={forceActive}
-                    aria-label="Manuel piyasa düşüş kilidi"
-                    disabled={forceBusy}
-                    onClick={() => void toggleForceDownturn()}
-                    className={`relative h-7 w-12 rounded-full transition-colors disabled:opacity-50 ${
-                      forceActive ? 'bg-red-600' : 'bg-slate-600'
-                    }`}
-                  >
-                    <span
-                      className={`absolute top-0.5 block h-6 w-6 rounded-full bg-white shadow transition-transform ${
-                        forceActive ? 'translate-x-5' : 'translate-x-0.5'
-                      }`}
-                    />
-                  </button>
+                  <ToggleForceDownturn
+                    forceActive={forceActive}
+                    forceBusy={forceBusy}
+                    onToggle={() => void toggleForceDownturn()}
+                  />
                 </div>
               </div>
             </section>
 
+            {regimeSummary && <RegimeSummaryBanner s={regimeSummary} />}
+
             {/* Aday readiness — "Giriş hazır" tablosu */}
             <section>
-              <h2 className="mb-2 text-lg font-medium">Aday Uygunluk (grid readiness)</h2>
-              <p className="mb-3 text-xs text-slate-400">
-                Liste: 15 dk scout (hacim + risk filtresi). Son 1 saatte sürekli düşen coinler listeye
-                alınmaz. <strong className="text-slate-300">Hazır</strong> = tüm kontroller yeşil.{' '}
-                <strong className="text-slate-300">Engel</strong> sütununda neden girilmediği Türkçe yazar.
+              <h2 className="mb-2 text-base font-medium sm:text-lg">Aday Uygunluk</h2>
+              <p className="mb-2 text-xs leading-relaxed text-slate-400 sm:hidden">
+                Scout listesi · <strong className="text-slate-300">Hazır</strong> = tüm kapılar yeşil.
+                Canlı fiyat ve 3dk/10dk/30dk/1s getiri %.
               </p>
-              {marketGate?.active && (
-                <div className="mb-3 rounded-lg border border-red-800/60 bg-red-950/40 px-3 py-2 text-xs text-red-200">
-                  Piyasa düşüş modu aktif — yeni grid kurulmaz (açık gridler süpürülür).
-                  {marketGate.reasons.includes('force_active') && (
-                    <span className="ml-1 font-medium text-red-100">[manuel kilidi]</span>
+              <p className="mb-3 hidden text-xs text-slate-400 sm:block">
+                Liste: 15 dk scout (hacim + risk filtresi). Son ~40 dk (8×5m) üst üste düşen coinler
+                listeye alınmaz. Kısa düşüş eşiği 2% (3×5m). <strong className="text-slate-300">Hazır</strong> = tüm kontroller yeşil.{' '}
+                <strong className="text-slate-300">Engel</strong> sütununda neden girilmediği Türkçe yazar.
+                Fiyat canlı; 3dk/10dk/30dk/1s getiri % (DO kline). EffRatio/ATR vb. hazırlık skorunda
+                arkada kalır. Piyasa kapısı regime_cache;
+                tam BTC/breadth ~30 sn.
+              </p>
+              {(marketGate?.active || regimeSummary?.defensiveActive) && (
+                <div className="mb-3 space-y-1.5 rounded-lg border border-red-800/60 bg-red-950/40 px-3 py-2.5 text-xs leading-relaxed text-red-200">
+                  {marketGate?.reasons.includes('force_active') ? (
+                    <p>
+                      <span className="font-medium text-red-100">Manuel kilit açık</span> — yeni grid
+                      kurulmaz.
+                    </p>
+                  ) : (
+                    <p>
+                      <span className="font-medium text-red-100">Piyasa düşüş / savunma aktif</span> —
+                      yeni grid kurulmaz.
+                    </p>
                   )}
-                  {marketGate.reasons.length > 0 && (
-                    <span className="ml-1 text-red-300/90">
-                      ({marketGate.reasons.join(', ')} · breadth {marketGate.breadthPct}%
+                  {regimeSummary?.defensiveActive && (
+                    <p className="text-red-300/90">
+                      Muaf olmayan aktif gridler recovery&apos;ye alınır; hedefin %1 altında MARKET
+                      çıkış.
+                    </p>
+                  )}
+                  {marketGate && marketGate.reasons.length > 0 && (
+                    <p className="text-[11px] text-red-300/80">
+                      {marketGate.reasons.join(', ')} · breadth {marketGate.breadthPct}%
                       {marketGate.btc24hChangePct != null
                         ? ` · BTC 24s ${marketGate.btc24hChangePct.toFixed(2)}%`
                         : ''}
-                      )
-                    </span>
+                    </p>
                   )}
                 </div>
               )}
-              <div className="overflow-x-auto rounded-lg border border-slate-800">
+              <div className="-mx-0.5 overflow-x-auto rounded-lg border border-slate-800 sm:mx-0">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-900 text-slate-400">
                     <tr>
                       <th className="px-2 py-2">Sembol</th>
+                      <th className="px-2 py-2">Fiyat</th>
                       <th className="px-2 py-2 min-w-[8rem]">Hazırlık</th>
                       <th className="px-2 py-2">Flash</th>
                       <th className="px-2 py-2">Path×</th>
                       <th className="px-2 py-2">Düşüş%</th>
                       <th className="px-2 py-2">Skor</th>
-                      <th className="px-2 py-2">EffRatio</th>
-                      <th className="px-2 py-2">Aralık%</th>
-                      <th className="px-2 py-2">ATR%</th>
-                      <th className="px-2 py-2">Spread%</th>
-                      <th className="px-2 py-2" title="Geçen kontrol / toplam">
-                        Kapı
+                      <th className="px-2 py-2" title="Güncel fiyata göre ~3 dk önceki 1m kapanış">
+                        3dk
+                      </th>
+                      <th className="px-2 py-2" title="~10 dk önceki 1m kapanış">
+                        10dk
+                      </th>
+                      <th className="px-2 py-2" title="~30 dk önceki 1m kapanış">
+                        30dk
+                      </th>
+                      <th className="px-2 py-2" title="~1 saat önceki 5m kapanış (12 bar)">
+                        1s
                       </th>
                       <th className="min-w-[9rem] px-2 py-2">Neden hazır değil?</th>
                     </tr>
@@ -620,15 +837,26 @@ function RecoveryRow({
   r,
   onConvert,
   busy,
+  ladderOpen,
+  ladderState,
+  ladderLoading,
+  onToggleLadder,
+  onExecuteStep,
 }: {
   r: GridRecoveryRow;
   onConvert: (r: GridRecoveryRow) => void;
   busy: boolean;
+  ladderOpen: boolean;
+  ladderState: RecoveryLadderState | null;
+  ladderLoading: boolean;
+  onToggleLadder: () => void;
+  onExecuteStep: (step: RecoveryLadderStep) => void;
 }) {
   const dec = priceDecimals(Number(r.targetPrice) || r.lastPrice);
   const waitMs = Date.now() - parseDbTimestamp(r.waitingSince).getTime();
   const loss = r.unrealizedPct != null && r.unrealizedPct < 0;
   return (
+    <>
     <tr className="border-t border-slate-800 bg-amber-950/20">
       <td className="px-2 py-2 font-mono">{r.symbol.replace('USDT', '')}</td>
       <td className="px-2 py-2 font-mono tabular-nums" title="Bu grid recovery_qty">
@@ -674,17 +902,132 @@ function RecoveryRow({
         {formatWait(waitMs)}
       </td>
       <td className="px-2 py-2">
-        <button
-          type="button"
-          onClick={() => onConvert(r)}
-          disabled={busy}
-          title={loss ? 'Zararına market satış yapılır' : 'Market satışla kapatılır'}
-          className="rounded-md border border-red-700/70 bg-red-900/30 px-2 py-1 text-[11px] text-red-200 hover:bg-red-900/60 disabled:opacity-50"
-        >
-          {busy ? '…' : 'USDT’ye çevir'}
-        </button>
+        <div className="flex flex-col gap-1 sm:flex-row sm:flex-wrap">
+          <button
+            type="button"
+            onClick={onToggleLadder}
+            disabled={busy && !ladderOpen}
+            title="Manuel kademeli al/sat (anchor = ort. maliyet)"
+            className={`rounded-md border px-2 py-1 text-[11px] disabled:opacity-50 ${
+              ladderOpen
+                ? 'border-amber-500/80 bg-amber-900/50 text-amber-100'
+                : 'border-amber-700/60 bg-amber-950/40 text-amber-200 hover:bg-amber-900/40'
+            }`}
+          >
+            {ladderOpen ? 'Kapat' : 'Kademeli'}
+            {!ladderOpen && r.ladderDoneCount > 0 && (
+              <span className="ml-1 text-[10px] text-amber-400/80">
+                ({r.ladderDoneCount}/10)
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => onConvert(r)}
+            disabled={busy}
+            title={loss ? 'Zararına market satış yapılır' : 'Market satışla kapatılır'}
+            className="rounded-md border border-red-700/70 bg-red-900/30 px-2 py-1 text-[11px] text-red-200 hover:bg-red-900/60 disabled:opacity-50"
+          >
+            {busy && !ladderOpen ? '…' : 'USDT’ye çevir'}
+          </button>
+        </div>
+        {r.ladderMovePct != null && !ladderOpen && (
+          <div className="mt-0.5 text-[10px] tabular-nums text-slate-500" title="Anchor’a göre hareket">
+            Δ {signed(r.ladderMovePct, 2)}%
+          </div>
+        )}
       </td>
     </tr>
+    {ladderOpen && (
+      <tr className="border-t border-amber-900/30 bg-amber-950/30">
+        <td colSpan={10} className="px-2 py-3">
+          {ladderLoading && !ladderState ? (
+            <p className="text-xs text-slate-400">Kademeli panel yükleniyor…</p>
+          ) : ladderState ? (
+            <RecoveryLadderPanel
+              state={ladderState}
+              busy={busy}
+              onExecuteStep={onExecuteStep}
+            />
+          ) : (
+            <p className="text-xs text-red-300/90">Panel yüklenemedi.</p>
+          )}
+        </td>
+      </tr>
+    )}
+    </>
+  );
+}
+
+function RecoveryLadderPanel({
+  state,
+  busy,
+  onExecuteStep,
+}: {
+  state: RecoveryLadderState;
+  busy: boolean;
+  onExecuteStep: (step: RecoveryLadderStep) => void;
+}) {
+  const dec = priceDecimals(state.anchor || state.lastPrice);
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-300">
+        <span>
+          Anchor: <span className="font-mono tabular-nums">{fmtPrice(state.anchor, dec)}</span>
+        </span>
+        <span>
+          Şu an:{' '}
+          <span className="font-mono tabular-nums">
+            {state.movePct != null ? `${signed(state.movePct, 2)}%` : '—'}
+          </span>
+          {state.lastPrice != null && (
+            <span className="ml-1 text-slate-500">({fmtPrice(state.lastPrice, dec)})</span>
+          )}
+        </span>
+        {state.positionValueUsdt != null && (
+          <span>Pozisyon: ≈ {state.positionValueUsdt.toFixed(2)} USDT</span>
+        )}
+        <span className="text-slate-500">
+          Tamamlanan: {state.doneCount}/10
+        </span>
+      </div>
+      <p className="text-[10px] text-slate-500">
+        Eşik geçilince cron otomatik uygular (config açıksa). Buradan erken adım veya eşik öncesi işlem yapabilirsin. Savunma modu ayrı çalışır.
+      </p>
+      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+        {state.steps.map((step) => {
+          const done = step.done;
+          const suggested = step.suggested && !done;
+          return (
+            <button
+              key={step.id}
+              type="button"
+              disabled={busy || done}
+              onClick={() => onExecuteStep(step)}
+              title={
+                done
+                  ? 'Tamamlandı'
+                  : suggested
+                    ? 'Eşik geçildi — önerilen adım'
+                    : 'Manuel uygula'
+              }
+              className={`rounded-md border px-2 py-2 text-left text-[11px] disabled:opacity-50 ${
+                done
+                  ? 'border-slate-700 bg-slate-900/60 text-slate-500 line-through'
+                  : suggested
+                    ? 'border-emerald-600/60 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-900/40'
+                    : 'border-slate-700 bg-slate-900/40 text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <span className="font-medium">{step.label}</span>
+              <span className="ml-2 text-[10px] text-slate-500">
+                {done ? 'yapıldı' : suggested ? 'hazır' : 'bekliyor'}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -704,6 +1047,228 @@ function flashBadge(level: GridCandidateRow['flashLevel']): { label: string; cla
   }
 }
 
+const GRID_WAIT_REASON_TR: Record<string, string> = {
+  no_ready_candidate: 'Hazır aday yok',
+  market_downturn: 'Piyasa düşüş kapısı',
+  market_panic: 'Panik rejimi',
+  force_active: 'Manuel kilit',
+  defensive_mode: 'Savunma modu',
+};
+
+function ToggleForceDownturn({
+  forceActive,
+  forceBusy,
+  onToggle,
+}: {
+  forceActive: boolean;
+  forceBusy: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={forceActive}
+      aria-label="Manuel piyasa düşüş kilidi"
+      disabled={forceBusy}
+      onClick={onToggle}
+      className={`relative h-7 w-12 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
+        forceActive ? 'bg-red-600' : 'bg-slate-600'
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 block h-6 w-6 rounded-full bg-white shadow transition-transform ${
+          forceActive ? 'translate-x-5' : 'translate-x-0.5'
+        }`}
+      />
+    </button>
+  );
+}
+
+function RegimeSummaryBanner({ s }: { s: GridRegimeSummary }) {
+  const tone =
+    s.setupEligibleCount >= 1
+      ? 'border-emerald-800/50 bg-emerald-950/30'
+      : s.isChop
+        ? 'border-amber-800/50 bg-amber-950/25'
+        : 'border-slate-700 bg-slate-900/60';
+  const headlineTone =
+    s.setupEligibleCount >= 1
+      ? 'text-emerald-200'
+      : s.isChop
+        ? 'text-amber-100'
+        : 'text-slate-200';
+  const cacheAge =
+    s.regimeCacheUpdatedAt != null ? formatDateTimeIstanbul(s.regimeCacheUpdatedAt) : null;
+  const waitAt = s.lastGridWaitAt != null ? formatDateTimeIstanbul(s.lastGridWaitAt) : null;
+  const waitReason =
+    s.lastGridWaitReason != null
+      ? (GRID_WAIT_REASON_TR[s.lastGridWaitReason] ?? s.lastGridWaitReason)
+      : null;
+
+  const defensiveShort =
+    s.defensiveReasons.length > 0 ? s.defensiveReasons.join(', ') : '—';
+
+  return (
+    <section className={`mb-4 rounded-lg border px-3 py-3 sm:px-4 sm:py-3 ${tone}`}>
+      <h2 className="text-sm font-medium text-slate-200">Rejim özeti</h2>
+      <p className={`mt-2 text-xs leading-relaxed sm:text-sm ${headlineTone}`}>{s.headline}</p>
+
+      {waitAt && (
+        <p className="mt-2 text-[11px] leading-snug text-slate-500">
+          Son bekleme: <span className="text-slate-400">{waitAt}</span>
+          {waitReason && <span> · {waitReason}</span>}
+        </p>
+      )}
+      {cacheAge && (
+        <p className="mt-1 text-[11px] text-slate-500">Cache: {cacheAge}</p>
+      )}
+
+      <div className="mt-3 grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:gap-2">
+        <SummaryChip
+          label={`Rejim ${s.regime}`}
+          ok={!s.isChop && s.regime !== 'panic'}
+          hint="chop/panic = zayıf evren"
+        />
+        <SummaryChip
+          label={`Breadth ${s.breadthPct != null ? `${s.breadthPct.toFixed(0)}%` : '—'}`}
+          ok={s.breadthAboveChop}
+          hint=">%45 chop biter"
+        />
+        <SummaryChip
+          label={`BTC ${s.btc24hChangePct != null ? `${s.btc24hChangePct >= 0 ? '+' : ''}${s.btc24hChangePct.toFixed(1)}%` : '—'}`}
+          ok={s.btc24hAboveRecovery}
+          hint="24s · >−2,5% toparlanma"
+        />
+        <SummaryChip
+          label={`Hazır ${s.readyCount}/${s.candidateCount}`}
+          ok={s.readyCount >= 1}
+          hint="Tüm kapılar yeşil"
+        />
+        <SummaryChip
+          label={`Kurulum ${s.setupEligibleCount}/${s.candidateCount}`}
+          ok={s.setupEligibleCount >= 1}
+          hint="Slot + kapılar uygun"
+        />
+        <SummaryChip
+          label={`3dk +${s.green3mCount}`}
+          ok={s.green3mCount >= 3}
+          hint={`3dk yeşil ${s.green3mCount}/${s.candidateCount}`}
+        />
+        <SummaryChip
+          label={`10dk +${s.green10mCount}`}
+          ok={s.green10mCount >= 3}
+          hint={`10dk yeşil ${s.green10mCount}/${s.candidateCount}`}
+        />
+        <SummaryChip
+          label={`Düşüş ${s.fallingNowCount}`}
+          ok={s.fallingNowCount <= 2}
+          hint="Şimdi düşüyor sayısı"
+        />
+        {(s.marketGateActive || s.defensiveActive) && (
+          <SummaryChip
+            label="Grid kapalı"
+            ok={false}
+            hint="Yeni kurulum engelli"
+            className="col-span-2 sm:col-span-1"
+          />
+        )}
+        {s.defensiveActive && (
+          <SummaryChip
+            label={`Savunma ${defensiveShort}`}
+            ok={false}
+            hint={`Muaf: ${s.defensiveExemptCount} grid · ${defensiveShort}`}
+            className="col-span-2 sm:col-span-1"
+          />
+        )}
+      </div>
+    </section>
+  );
+}
+
+function SummaryChip({
+  label,
+  ok,
+  hint,
+  className = '',
+}: {
+  label: string;
+  ok: boolean;
+  hint?: string;
+  className?: string;
+}) {
+  return (
+    <span
+      title={hint}
+      className={`block truncate rounded-md border px-2 py-1.5 text-center text-[11px] font-medium sm:inline-block sm:w-auto sm:py-1 ${
+        ok
+          ? 'border-emerald-800/60 bg-emerald-950/40 text-emerald-300'
+          : 'border-slate-700 bg-slate-950/50 text-slate-400'
+      } ${className}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+function marketGateBlockerId(gate: GridMarketGate): string {
+  if (gate.reasons.includes('panic')) return 'market_panic';
+  if (gate.reasons.includes('force_active')) return 'force_active';
+  return 'market_downturn';
+}
+
+function PctChangeCell({ pct, title }: { pct: number | null; title?: string }) {
+  if (pct == null) {
+    return <span className="text-slate-500">—</span>;
+  }
+  const tone =
+    pct > 0 ? 'text-emerald-400' : pct < 0 ? 'text-red-400' : 'text-slate-400';
+  const label = `${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`;
+  return (
+    <span className={`font-mono tabular-nums ${tone}`} title={title}>
+      {label}
+    </span>
+  );
+}
+
+function CandidatePriceCell({
+  price,
+  changePct3m,
+}: {
+  price: number | null;
+  changePct3m: number | null;
+}) {
+  if (price == null || !(price > 0)) {
+    return <span className="text-slate-500">—</span>;
+  }
+  const dec = priceDecimals(price);
+  const tone =
+    changePct3m != null && changePct3m > 0
+      ? 'text-emerald-400'
+      : changePct3m != null && changePct3m < 0
+        ? 'text-red-400'
+        : 'text-slate-300';
+  const arrow =
+    changePct3m != null && changePct3m > 0
+      ? '↑'
+      : changePct3m != null && changePct3m < 0
+        ? '↓'
+        : null;
+  return (
+    <span
+      className={`inline-flex items-center gap-0.5 font-mono tabular-nums ${tone}`}
+      title={changePct3m != null ? `Son 3 dk: ${changePct3m > 0 ? '+' : ''}${changePct3m.toFixed(2)}%` : undefined}
+    >
+      {arrow != null && (
+        <span className="text-[11px] font-semibold leading-none" aria-hidden>
+          {arrow}
+        </span>
+      )}
+      {fmtPrice(price, dec)}
+    </span>
+  );
+}
+
 function CandidateRow({
   c,
   marketGate,
@@ -713,6 +1278,15 @@ function CandidateRow({
 }) {
   const flash = flashBadge(c.flashLevel);
   const marketBlocked = Boolean(marketGate?.active);
+  const marketBlockerId = marketGate ? marketGateBlockerId(marketGate) : 'market_downturn';
+  const displayBlocker =
+    c.primaryBlocker === 'market_panic' ||
+    c.primaryBlocker === 'market_downturn' ||
+    c.primaryBlocker === 'force_active'
+      ? c.primaryBlocker
+      : marketBlocked
+        ? marketBlockerId
+        : c.primaryBlocker;
   const rowSetup = c.setupEligible && !marketBlocked;
   const recoveringBlocks =
     c.isRecovering && c.ready && !c.isActive && !c.setupEligible;
@@ -758,6 +1332,9 @@ function CandidateRow({
           </span>
         )}
       </td>
+      <td className="px-2 py-2 whitespace-nowrap">
+        <CandidatePriceCell price={c.lastPrice} changePct3m={c.priceChangePct3m} />
+      </td>
       <td className="px-2 py-2 min-w-[8rem]">
         <ReadinessBar passed={c.gatesPassed} total={c.gatesTotal} ready={c.ready && !marketBlocked} />
       </td>
@@ -772,38 +1349,33 @@ function CandidateRow({
       </td>
       <td className="px-2 py-2 font-mono tabular-nums text-slate-400">{num(c.windowDropPct, 2)}</td>
       <td className="px-2 py-2 font-mono tabular-nums text-slate-300">{num(c.score, 1)}</td>
-      <td
-        className={`px-2 py-2 font-mono tabular-nums ${
-          c.efficiencyRatio != null && c.efficiencyRatio <= 0.35 ? 'text-emerald-400' : 'text-amber-400'
-        }`}
-      >
-        {num(c.efficiencyRatio, 3)}
+      <td className="px-2 py-2">
+        <PctChangeCell pct={c.priceChangePct3m} title="Son ~3 dk getiri" />
       </td>
-      <td className="px-2 py-2 font-mono tabular-nums text-slate-300">{num(c.rangeWidthPct, 2)}</td>
-      <td className="px-2 py-2 font-mono tabular-nums text-slate-300">{num(c.atrPct, 2)}</td>
-      <td className="px-2 py-2 font-mono tabular-nums text-slate-400">{num(c.spreadPct, 3)}</td>
-      <td className="px-2 py-2 font-mono tabular-nums text-slate-400">
-        {c.gatesPassed}/{c.gatesTotal}
+      <td className="px-2 py-2">
+        <PctChangeCell pct={c.priceChangePct10m} title="Son ~10 dk getiri" />
+      </td>
+      <td className="px-2 py-2">
+        <PctChangeCell pct={c.priceChangePct30m} title="Son ~30 dk getiri" />
+      </td>
+      <td className="px-2 py-2">
+        <PctChangeCell pct={c.priceChangePct1h} title="Son ~1 saat getiri (5m)" />
       </td>
       <td
         className="max-w-[11rem] px-2 py-2 text-[10px] leading-snug text-amber-300/95"
         title={
           rowSetup
             ? ''
-            : marketBlocked && c.primaryBlocker
-              ? blockerHint(c.primaryBlocker)
-              : recoveringBlocks
-                ? blockerHint('recovering_blocks_setup')
-                : blockerHint(c.primaryBlocker)
+            : recoveringBlocks
+              ? blockerHint('recovering_blocks_setup')
+              : blockerHint(displayBlocker)
         }
       >
         {rowSetup
           ? '—'
-          : marketBlocked && c.primaryBlocker
-            ? blockerLabel(c.primaryBlocker)
-            : recoveringBlocks
-              ? blockerLabel('recovering_blocks_setup')
-              : blockerLabel(c.primaryBlocker)}
+          : recoveringBlocks
+            ? blockerLabel('recovering_blocks_setup')
+            : blockerLabel(displayBlocker)}
       </td>
     </tr>
   );

@@ -366,6 +366,15 @@ export interface GridStatusReport {
   } | null;
 }
 
+/** `/grid-live` — aktif kartlarda canlı güncellenen alanlar. */
+export interface GridStatusLivePatch {
+  gridId: number;
+  lastPrice: number | null;
+  rangeStatus: string | null;
+  inventoryUnrealizedPct?: number | null;
+  flashDrop?: GridStatusReport['flashDrop'];
+}
+
 export interface GridMarketGate {
   active: boolean;
   reasons: string[];
@@ -374,6 +383,31 @@ export interface GridMarketGate {
   btc15mReturnPct: number | null;
   regime: string;
   forceActive: boolean;
+}
+
+export interface GridRegimeSummary {
+  regime: string;
+  breadthPct: number | null;
+  btc24hChangePct: number | null;
+  btc15mReturnPct: number | null;
+  regimeCacheUpdatedAt: string | null;
+  isChop: boolean;
+  breadthAboveChop: boolean;
+  breadthAboveWeak: boolean;
+  btc24hAboveRecovery: boolean;
+  marketGateActive: boolean;
+  candidateCount: number;
+  readyCount: number;
+  setupEligibleCount: number;
+  fallingNowCount: number;
+  green3mCount: number;
+  green10mCount: number;
+  lastGridWaitAt: string | null;
+  lastGridWaitReason: string | null;
+  headline: string;
+  defensiveActive: boolean;
+  defensiveReasons: string[];
+  defensiveExemptCount: number;
 }
 
 export interface GridCandidateRow {
@@ -393,6 +427,10 @@ export interface GridCandidateRow {
   gatesPassed: number;
   gatesTotal: number;
   lastPrice: number | null;
+  priceChangePct3m: number | null;
+  priceChangePct10m: number | null;
+  priceChangePct30m: number | null;
+  priceChangePct1h: number | null;
   flashLevel: 'none' | 'warn' | 'pause' | 'recovery' | null;
   windowDropPct: number | null;
   downsideBlocked: boolean;
@@ -418,6 +456,32 @@ export interface GridRecoveryRow {
   walletLocked: number;
   walletTotal: number;
   excessFree: number;
+  ladderMovePct: number | null;
+  ladderDoneCount: number;
+}
+
+export type RecoveryLadderStepKind = 'hold' | 'buy' | 'sell' | 'sell_all';
+
+export interface RecoveryLadderStep {
+  id: string;
+  label: string;
+  kind: RecoveryLadderStepKind;
+  thresholdPct: number;
+  actionPct: number | null;
+  done: boolean;
+  suggested: boolean;
+}
+
+export interface RecoveryLadderState {
+  gridId: number;
+  symbol: string;
+  anchor: number;
+  lastPrice: number | null;
+  movePct: number | null;
+  positionValueUsdt: number | null;
+  recoveryQty: string;
+  steps: RecoveryLadderStep[];
+  doneCount: number;
 }
 
 export interface GridDashboard {

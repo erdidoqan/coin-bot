@@ -205,6 +205,12 @@ export type BotConfigKey =
   | 'grid_market_downturn_block_panic'
   | 'grid_market_downturn_allow_manual'
   | 'grid_market_downturn_force_active'
+  | 'grid_defensive_mode_enabled'
+  | 'grid_recovery_ladder_auto_enabled'
+  | 'grid_defensive_recovery_stop_pct'
+  | 'grid_defensive_exempt_grid_ids'
+  | 'grid_defensive_exempt_initialized'
+  | 'grid_setup_market_entry'
   | 'grid_run_lock'
 
 const ENV_FALLBACK: Partial<Record<BotConfigKey, keyof Env>> = {
@@ -379,7 +385,7 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   grid_flash_drop_symbol_cooldown_min: '60',
   grid_readiness_downside_bars: '3',
   grid_readiness_short_return_bars: '3',
-  grid_readiness_momentum_warn_pct: '3.0',
+  grid_readiness_momentum_warn_pct: '2.0',
   grid_readiness_post_exit_relax_enabled: 'false',
   grid_readiness_post_exit_relax_days: '10',
   grid_readiness_post_exit_momentum_warn_pct: '7',
@@ -389,7 +395,7 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   grid_readiness_post_exit_cooldown_enabled: 'true',
   grid_readiness_post_exit_cooldown_min: '45',
   grid_readiness_hour_decline_enabled: 'true',
-  grid_readiness_hour_decline_bars: '12',
+  grid_readiness_hour_decline_bars: '8',
   grid_readiness_max_path_range_ratio: '12',
   grid_readiness_max_bar_range_path_ratio: '18',
   grid_readiness_max_stability_range_pct: '28',
@@ -412,7 +418,7 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   grid_ladder_mode: 'breakeven_dip',
   grid_floor_exit_margin_pct: '0.5',
   grid_dip_buy_defer_steps: '1',
-  grid_market_downturn_enabled: 'true',
+  grid_market_downturn_enabled: 'false',
   grid_market_downturn_breadth_max_pct: '38',
   grid_market_downturn_btc_24h_pct: '-2.5',
   grid_market_downturn_btc_15m_return_pct: '-0.8',
@@ -420,6 +426,12 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   grid_market_downturn_block_panic: 'true',
   grid_market_downturn_allow_manual: 'false',
   grid_market_downturn_force_active: 'false',
+  grid_defensive_mode_enabled: 'true',
+  grid_recovery_ladder_auto_enabled: 'true',
+  grid_defensive_recovery_stop_pct: '1.0',
+  grid_defensive_exempt_grid_ids: '[]',
+  grid_defensive_exempt_initialized: 'false',
+  grid_setup_market_entry: 'false',
   grid_run_lock: '0',
 };
 

@@ -216,14 +216,31 @@ export async function fetchRegimeFromDo(
 }
 
 export async function fetchSymbolMidPrice(env: Env, symbol: string): Promise<string | null> {
+  const map = await fetchSymbolMidPrices(env, [symbol]);
+  return map.get(symbol.toUpperCase()) ?? null;
+}
+
+/** Tek DO çağrısıyla birden fazla sembol mid (panel canlı fiyat). */
+export async function fetchSymbolMidPrices(
+  env: Env,
+  symbols: string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
   const stub = marketDataStub(env);
-  if (!stub) return null;
-  const url = new URL('https://do.internal/book');
-  url.searchParams.set('symbol', symbol);
+  const uniq = [...new Set(symbols.map((s) => s.toUpperCase()).filter((s) => s.endsWith('USDT')))];
+  if (!stub || uniq.length === 0) return out;
+  const url = new URL('https://do.internal/books');
+  url.searchParams.set('symbols', uniq.join(','));
   const res = await stub.fetch(url.toString());
-  if (!res.ok) return null;
-  const body = await res.json<{ mid: string | null }>();
-  return body.mid;
+  if (!res.ok) return out;
+  const body = await res.json<{
+    books: Array<{ symbol: string; mid: string | null }>;
+  }>();
+  for (const b of body.books ?? []) {
+    const mid = Number(b.mid);
+    if (mid > 0) out.set(b.symbol.toUpperCase(), mid);
+  }
+  return out;
 }
 
 export async function fetchOrderbookMetrics(

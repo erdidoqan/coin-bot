@@ -23,6 +23,10 @@ import { usesBinanceProxy } from '../exchange/binance-fetch';
 import { isTriggerAuthorized, parseManualJob, runManualJob } from '../trigger';
 import { runForceClose } from '../jobs/force-close';
 import { convertRecoveryToUsdt } from '../jobs/recovery-convert';
+import {
+  executeRecoveryLadderStep,
+  getRecoveryLadderState,
+} from '../jobs/recovery-ladder';
 import { enrichWatchlistLive, formatWatchlistForAdmin } from './watchlist-enrich';
 import { fetchMarketDataStatus } from '../exchange/market-data-client';
 import { buildTickLiveReport } from './tick-live';
@@ -31,6 +35,7 @@ import {
   buildGridDashboard,
   buildGridCandidates,
   buildGridCandidatesReport,
+  buildGridStatusesLive,
   buildOrphanBalances,
 } from './grid-status';
 import { getShadowSummary } from '../db/micro-shadow';
@@ -114,6 +119,11 @@ const CONFIG_KEYS: BotConfigKey[] = [
   'grid_market_downturn_block_panic',
   'grid_market_downturn_allow_manual',
   'grid_market_downturn_force_active',
+  'grid_defensive_mode_enabled',
+  'grid_recovery_ladder_auto_enabled',
+  'grid_defensive_recovery_stop_pct',
+  'grid_defensive_exempt_grid_ids',
+  'grid_setup_market_entry',
   'grid_use_watchlist',
   'grid_candidate_count',
   'grid_max_efficiency_ratio',
@@ -262,8 +272,16 @@ export async function handleAdminApi(request: Request, env: Env): Promise<Respon
       return jsonResponse(request, report);
     }
 
+    if (path === '/grid-live' && request.method === 'GET') {
+      const grids = await buildGridStatusesLive(env);
+      return jsonResponse(request, { grids });
+    }
+
     if (path === '/grid-candidates' && request.method === 'GET') {
-      const report = await buildGridCandidatesReport(env);
+      const live = new URL(request.url).searchParams.get('live') === '1';
+      const report = await buildGridCandidatesReport(env, {
+        skipMarketDownturn: live,
+      });
       return jsonResponse(request, report);
     }
 
@@ -279,6 +297,34 @@ export async function handleAdminApi(request: Request, env: Env): Promise<Respon
       }
       const result = await convertRecoveryToUsdt(env, body.gridId);
       return jsonResponse(request, result, result.ok ? 200 : 400);
+    }
+
+    if (path === '/grid-recovery-ladder') {
+      if (request.method === 'GET') {
+        const gridId = Number(new URL(request.url).searchParams.get('gridId'));
+        if (!Number.isFinite(gridId) || gridId <= 0) {
+          return jsonResponse(request, { error: 'gridId required' }, 400);
+        }
+        const state = await getRecoveryLadderState(env, gridId);
+        if (!state) {
+          return jsonResponse(request, { error: 'not_recovering' }, 404);
+        }
+        return jsonResponse(request, state);
+      }
+      if (request.method === 'POST') {
+        const body = (await request.json()) as { gridId?: number; stepId?: string };
+        if (typeof body.gridId !== 'number' || typeof body.stepId !== 'string' || !body.stepId) {
+          return jsonResponse(request, { error: 'gridId and stepId required' }, 400);
+        }
+        const result = await executeRecoveryLadderStep(env, body.gridId, body.stepId);
+        const status =
+          result.message === 'already_done'
+            ? 409
+            : result.ok
+              ? 200
+              : 400;
+        return jsonResponse(request, result, status);
+      }
     }
 
     if (path === '/grid-cancel' && request.method === 'POST') {

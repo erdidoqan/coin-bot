@@ -20,7 +20,8 @@
     "test:tick-reversal": "npx tsx scripts/tick-reversal.test.mjs",
     "test:tick-fire-debounce": "npx tsx scripts/tick-fire-debounce.test.mjs",
     "test:grid-market-downturn": "npx tsx scripts/grid-market-downturn.test.mjs",
-    "test:grid-readiness": "npx tsx scripts/grid-readiness.test.mjs"
+    "test:grid-readiness": "npx tsx scripts/grid-readiness.test.mjs",
+    "test:grid-setup-market-entry": "npx tsx scripts/grid-setup-market-entry.test.mjs"
   },
   "dependencies": {
     "bignumber.js": "^9.3.1"

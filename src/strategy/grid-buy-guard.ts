@@ -109,7 +109,12 @@ export function shouldBlockNewGridBuy(
   cfg: GridBuyGuardConfig,
 ): GridBuyGuardDecision {
   if (!cfg.enabled || !cfg.blockNewOnNotReady) return { block: false, reason: null };
-  return evaluateBuyGuard(input, cfg, BUY_CANCEL_BLOCKERS);
+  const guard = evaluateBuyGuard(input, cfg, BUY_CANCEL_BLOCKERS);
+  if (guard.block) return guard;
+  if (!input.readiness.ready) {
+    return { block: true, reason: input.readiness.primaryBlocker ?? 'not_ready' };
+  }
+  return { block: false, reason: null };
 }
 
 export function shouldTeardownForReadiness(
@@ -118,6 +123,9 @@ export function shouldTeardownForReadiness(
 ): GridBuyGuardDecision {
   if (!cfg.enabled || !cfg.teardownOnReadinessBlockers) {
     return { block: false, reason: null };
+  }
+  if (!input.readiness.ready) {
+    return { block: true, reason: input.readiness.primaryBlocker ?? 'not_ready' };
   }
   if (readinessBlockerBlocks(input.readiness, cfg.teardownReadinessBlockers)) {
     return { block: true, reason: input.readiness.primaryBlocker ?? 'not_ready' };

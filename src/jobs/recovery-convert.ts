@@ -36,7 +36,9 @@ export interface RecoveryConvertResult {
 export async function convertRecoveryToUsdt(
   env: Env,
   gridId: number,
+  opts?: { source?: string },
 ): Promise<RecoveryConvertResult> {
+  const source = opts?.source ?? 'manual_convert';
   const grid = await getGridById(env.DB, gridId);
   if (!grid) return { ok: false, message: 'not_found' };
   if (grid.status !== 'RECOVERING') return { ok: false, message: 'not_recovering' };
@@ -82,7 +84,7 @@ export async function convertRecoveryToUsdt(
       qty: '0',
       avgCost,
       pnl: '0',
-      source: 'manual_convert',
+      source,
       note: 'no_sellable_qty',
     });
     return { ok: true, message: 'closed_no_qty', symbol, pnl: '0' };
@@ -120,13 +122,13 @@ export async function convertRecoveryToUsdt(
     proceeds: proceeds.toFixed(6),
     lastPrice,
     pnl,
-    source: 'manual_convert',
+    source,
   });
 
   // Güvenlik: grid hâlâ recovering kaldıysa durdur.
   const after = await getGridById(env.DB, gridId);
   if (after && after.status === 'RECOVERING') {
-    await stopGrid(env.DB, gridId, 'manual_convert');
+    await stopGrid(env.DB, gridId, source);
   }
 
   return { ok: true, message: 'converted', symbol, pnl, proceeds: proceeds.toFixed(6) };

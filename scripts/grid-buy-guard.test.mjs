@@ -62,11 +62,20 @@ t('not in watchlist triggers block new buy', () => {
   assert.equal(shouldBlockNewGridBuy(a, guardCfg).reason, 'not_in_watchlist');
 });
 
-t('teardown only configured blockers', () => {
+t('teardown when not ready (aday uygunluk)', () => {
   const a = snap({
-    readiness: { ready: false, primaryBlocker: 'medium_downside', gates: [], score: 50 },
+    readiness: { ready: false, primaryBlocker: 'pct_3m_decline', gates: [], score: 98 },
   });
-  assert.equal(shouldTeardownForReadiness(a, guardCfg).block, false);
+  assert.equal(shouldTeardownForReadiness(a, guardCfg).block, true);
+  assert.equal(shouldTeardownForReadiness(a, guardCfg).reason, 'pct_3m_decline');
+});
+
+t('block new buy when not ready', () => {
+  const a = snap({
+    readiness: { ready: false, primaryBlocker: 'path_stability', gates: [], score: 97 },
+  });
+  assert.equal(shouldBlockNewGridBuy(a, guardCfg).block, true);
+  assert.equal(shouldBlockNewGridBuy(a, guardCfg).reason, 'path_stability');
 });
 
 t('recenter skip when not ready', () => {

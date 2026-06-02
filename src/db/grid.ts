@@ -22,6 +22,7 @@ export interface GridStateRow {
   recovery_target_price: string | null;
   recovery_qty: string | null;
   recovery_avg_cost: string | null;
+  recovery_ladder_done: string | null;
   anchor_price: string | null;
   created_at: string;
   updated_at: string;
@@ -133,6 +134,14 @@ export interface GridConfig {
   marketDownturnAllowManual: boolean;
   /** true → eşiklerden bağımsız düşüş modu aktif (manuel kilidi). */
   marketDownturnForceActive: boolean;
+  /** Chop / düşüş / manuel kilit: yeni grid yok, aktif → recovery, recovery stop. */
+  defensiveModeEnabled: boolean;
+  /** Kurtarma kademeli: eşik geçilince cron otomatik adım uygular. */
+  recoveryLadderAutoEnabled: boolean;
+  defensiveRecoveryStopPct: number;
+  defensiveExemptGridIds: number[];
+  /** Kurulumda bir seviye payı (investment/gridCount) MARKET alım. */
+  setupMarketEntry: boolean;
 }
 
 export async function getGridConfig(db: D1Database, env: Env): Promise<GridConfig> {
@@ -218,6 +227,11 @@ export async function getGridConfig(db: D1Database, env: Env): Promise<GridConfi
     marketDownturnBlockPanic,
     marketDownturnAllowManual,
     marketDownturnForceActive,
+    defensiveModeEnabled,
+    recoveryLadderAuto,
+    defensiveRecoveryStopPct,
+    defensiveExemptGridIds,
+    setupMarketEntry,
   ] = await Promise.all([
     getConfig(db, 'grid_enabled', env),
     getConfig(db, 'live_gate', env),
@@ -300,6 +314,11 @@ export async function getGridConfig(db: D1Database, env: Env): Promise<GridConfi
     getConfig(db, 'grid_market_downturn_block_panic', env),
     getConfig(db, 'grid_market_downturn_allow_manual', env),
     getConfig(db, 'grid_market_downturn_force_active', env),
+    getConfig(db, 'grid_defensive_mode_enabled', env),
+    getConfig(db, 'grid_recovery_ladder_auto_enabled', env),
+    getConfig(db, 'grid_defensive_recovery_stop_pct', env),
+    getConfig(db, 'grid_defensive_exempt_grid_ids', env),
+    getConfig(db, 'grid_setup_market_entry', env),
   ]);
   const parsedLadder = String(ladderMode || 'breakeven_dip').toLowerCase();
   return {
@@ -356,7 +375,7 @@ export async function getGridConfig(db: D1Database, env: Env): Promise<GridConfi
     flashDropSymbolCooldownMin: Math.max(0, Number(flashCooldown) || 60),
     readinessDownsideBars: Math.max(0, Number(readinessDownsideBars) || 3),
     readinessShortReturnBars: Math.max(1, Number(readinessShortReturnBars) || 3),
-    readinessMomentumWarnPct: Math.max(0, Number(readinessMomentumWarn) || 4),
+    readinessMomentumWarnPct: Math.max(0, Number(readinessMomentumWarn) || 2),
     readinessPostExitRelaxEnabled: readinessPostExitRelaxEnabled !== 'false',
     readinessPostExitRelaxDays: Math.max(1, Number(readinessPostExitRelaxDays) || 10),
     readinessPostExitMomentumWarnPct: Math.max(
@@ -369,7 +388,7 @@ export async function getGridConfig(db: D1Database, env: Env): Promise<GridConfi
     readinessPostExitCooldownEnabled: readinessPostExitCooldownEnabled !== 'false',
     readinessPostExitCooldownMin: Math.max(0, Number(readinessPostExitCooldownMin) || 45),
     readinessHourDeclineEnabled: readinessHourDeclineEnabled !== 'false',
-    readinessHourDeclineBars: Math.max(0, Math.min(96, Number(readinessHourDeclineBars) || 12)),
+    readinessHourDeclineBars: Math.max(0, Math.min(96, Number(readinessHourDeclineBars) || 8)),
     allowNewGridWhileRecovering: allowNewWhileRecovering !== 'false',
     readinessMaxPathRangeRatio: Math.max(0, Number(readinessMaxPathRatio) || 12),
     readinessMaxBarRangePathRatio: Math.max(0, Number(readinessMaxBarPathRatio) || 18),
@@ -390,7 +409,27 @@ export async function getGridConfig(db: D1Database, env: Env): Promise<GridConfi
     marketDownturnBlockPanic: marketDownturnBlockPanic !== 'false',
     marketDownturnAllowManual: marketDownturnAllowManual === 'true',
     marketDownturnForceActive: marketDownturnForceActive === 'true',
+    defensiveModeEnabled: defensiveModeEnabled !== 'false',
+    recoveryLadderAutoEnabled: recoveryLadderAuto !== 'false',
+    defensiveRecoveryStopPct: Math.max(0.1, Number(defensiveRecoveryStopPct) || 1),
+    defensiveExemptGridIds: parseDefensiveExemptGridIds(defensiveExemptGridIds),
+    setupMarketEntry: setupMarketEntry === 'true',
   };
+}
+
+function parseDefensiveExemptGridIds(raw: string): number[] {
+  const s = String(raw ?? '').trim();
+  if (!s) return [];
+  try {
+    const arr = JSON.parse(s) as unknown;
+    if (!Array.isArray(arr)) return [];
+    return arr.map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0);
+  } catch {
+    return s
+      .split(',')
+      .map((x) => Number(x.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+  }
 }
 
 export async function getActiveGrid(db: D1Database): Promise<GridStateRow | null> {
@@ -877,9 +916,54 @@ export async function closeRecoveredGrid(
            recovery_target_price = NULL,
            recovery_qty = NULL,
            recovery_avg_cost = NULL,
+           recovery_ladder_done = NULL,
            updated_at = datetime('now')
        WHERE id = ?`,
     )
     .bind(pnlDelta, gridId)
     .run();
+}
+
+export function parseRecoveryLadderDone(raw: string | null | undefined): string[] {
+  if (!raw?.trim()) return [];
+  try {
+    const arr = JSON.parse(raw) as unknown;
+    if (!Array.isArray(arr)) return [];
+    return arr.map((x) => String(x)).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+export async function getRecoveryLadderDone(db: D1Database, gridId: number): Promise<string[]> {
+  const row = await db
+    .prepare('SELECT recovery_ladder_done FROM grid_state WHERE id = ?')
+    .bind(gridId)
+    .first<{ recovery_ladder_done: string | null }>();
+  return parseRecoveryLadderDone(row?.recovery_ladder_done);
+}
+
+export async function setRecoveryLadderDone(
+  db: D1Database,
+  gridId: number,
+  done: string[],
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE grid_state SET recovery_ladder_done = ?, updated_at = datetime('now') WHERE id = ?`,
+    )
+    .bind(done.length > 0 ? JSON.stringify(done) : null, gridId)
+    .run();
+}
+
+export async function appendRecoveryLadderDone(
+  db: D1Database,
+  gridId: number,
+  stepId: string,
+): Promise<string[]> {
+  const done = await getRecoveryLadderDone(db, gridId);
+  if (done.includes(stepId)) return done;
+  const next = [...done, stepId];
+  await setRecoveryLadderDone(db, gridId, next);
+  return next;
 }

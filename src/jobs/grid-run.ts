@@ -42,7 +42,8 @@ import {
   isOrderGoneError,
   serializeBinanceError,
 } from '../exchange/order-errors';
-import { TradingGateway } from '../exchange/gateway';
+import { TradingGateway, netQtyFromBuy } from '../exchange/gateway';
+import type { OrderResponse } from '../exchange/binance';
 import {
   parseSymbolFilters,
   formatPrice,
@@ -81,6 +82,8 @@ import {
 } from '../strategy/grid';
 import {
   evaluateGridReadiness,
+  applyPriceChangePct3mPenalty,
+  rollingReturnPct,
   minutesSinceSqliteUtc,
   type GridReadinessResult,
 } from '../strategy/grid-readiness';
@@ -95,6 +98,7 @@ import {
   fetchReadinessKlines,
   fetchOrderbookMetrics,
   fetchSymbolMidPrice,
+  ensureMarketDataWatchlist,
 } from '../exchange/market-data-client';
 import { bn } from '../math/decimal';
 import { getConfig, setConfig } from '../db/bot-config';
@@ -116,6 +120,15 @@ import {
 import { capRecoverySellBaseQty } from '../strategy/grid-recovery-qty';
 import { blockSetupForMarketDownturn } from '../strategy/grid-market-downturn';
 import {
+  blockSetupForDefensiveMode,
+  isGridDefensiveExempt,
+  resolveDefensiveMarketMode,
+  shouldStopRecoveryAtTarget,
+  type DefensiveMarketMode,
+} from '../strategy/grid-defensive-mode';
+import { convertRecoveryToUsdt } from './recovery-convert';
+import { maybeAutoExecuteRecoveryLadder } from './recovery-ladder';
+import {
   buyGuardConfigFromGrid,
   buildAssessmentLogPayload,
   buildGridBuyGuardAssessment,
@@ -132,13 +145,12 @@ const flashBuyBlockByGrid = new Map<number, boolean>();
 /** maintainGrid turu başına tek readiness snapshot (gridId). */
 const maintainBuyGuardByGridId = new Map<number, GridBuyGuardAssessment>();
 
+/** runGridMaintenance başına bir kez çözümlenen savunma modu. */
+let maintenanceDefensiveMode: DefensiveMarketMode | null = null;
+
 function needsBuyGuardAssessment(cfg: GridConfig): boolean {
   if (cfg.rangeMode === 'manual') return false;
-  return (
-    cfg.buyGuardEnabled ||
-    (cfg.readinessTeardownEnabled && cfg.teardownOnReadinessBlockers) ||
-    cfg.recenterRequiresReady
-  );
+  return cfg.buyGuardEnabled || cfg.readinessTeardownEnabled || cfg.recenterRequiresReady;
 }
 
 async function loadBuyGuardContextMaps(
@@ -393,13 +405,24 @@ export async function runGridMaintenance(env: Env): Promise<void> {
 
   try {
     flashBuyBlockByGrid.clear();
+    maintenanceDefensiveMode = null;
     const gateway = new TradingGateway(env);
+    const wl = await listWatchlist(env.DB);
+    const downturnSyms = cfg.useWatchlist
+      ? wl.map((w) => w.symbol)
+      : [cfg.symbol];
+    maintenanceDefensiveMode = await resolveDefensiveMarketMode(
+      env,
+      gateway.binance,
+      cfg,
+      downturnSyms,
+    );
 
     // 1) Tüm aktif grid'leri bakım yap (her biri kendi sembolünde).
     const actives = await getActiveGrids(env.DB);
     for (const g of actives) {
       try {
-        await maintainGrid(env, gateway, cfg, g);
+        await maintainGrid(env, gateway, cfg, g, maintenanceDefensiveMode);
       } catch (err) {
         await logEvent(env.DB, 'GRID_MAINTAIN_ERROR', {
           gridId: g.id,
@@ -412,7 +435,7 @@ export async function runGridMaintenance(env: Env): Promise<void> {
     const recovering = await getRecoveringGrids(env.DB);
     for (const g of recovering) {
       try {
-        await maintainRecovery(env, gateway, cfg, g);
+        await maintainRecovery(env, gateway, cfg, g, maintenanceDefensiveMode);
       } catch (err) {
         await logEvent(env.DB, 'GRID_RECOVERY_ERROR', {
           gridId: g.id,
@@ -431,9 +454,10 @@ export async function runGridMaintenance(env: Env): Promise<void> {
       if (!cfg.allowNewGridWhileRecovering) {
         for (const g of recovering) exclude.add(g.symbol);
       }
-      await setupGrids(env, gateway, cfg, slots, exclude);
+      await setupGrids(env, gateway, cfg, slots, exclude, maintenanceDefensiveMode);
     }
   } finally {
+    maintenanceDefensiveMode = null;
     await releaseGridLock(env);
   }
 }
@@ -545,7 +569,10 @@ async function assessCandidate(
     postExitCooldownMin: cfg.readinessPostExitCooldownMin,
     hourDeclineBars: cfg.readinessHourDeclineEnabled ? cfg.readinessHourDeclineBars : 0,
   });
-  return { readiness: merged.readiness, lastPrice };
+  const klines1m = await fetchKlinesFromDo(env, symbol, '1m', 35);
+  const priceChangePct3m = rollingReturnPct(lastPrice, klines1m, 3);
+  const readiness = applyPriceChangePct3mPenalty(merged.readiness, priceChangePct3m);
+  return { readiness, lastPrice };
 }
 
 /**
@@ -558,11 +585,18 @@ async function setupGrids(
   cfg: GridConfig,
   slots: number,
   exclude: Set<string>,
+  defensiveMode: DefensiveMarketMode | null,
 ): Promise<void> {
   const wl = await listWatchlist(env.DB);
   const downturnSyms = cfg.useWatchlist
     ? wl.map((w) => w.symbol)
     : [cfg.symbol];
+  const defensive =
+    defensiveMode ??
+    (await resolveDefensiveMarketMode(env, gateway.binance, cfg, downturnSyms));
+  if (await blockSetupForDefensiveMode(env.DB, defensive)) {
+    return;
+  }
   if (
     await blockSetupForMarketDownturn(env, gateway.binance, cfg, downturnSyms, {
       manualMode: cfg.rangeMode === 'manual',
@@ -660,6 +694,214 @@ function makerSellPrice(target: number, lastPrice: number, tickSize: string): st
     guard++;
   }
   return s;
+}
+
+function avgFillPriceFromBuyOrder(order: OrderResponse): number | null {
+  const exec = Number(order.executedQty);
+  const quote = Number(order.cummulativeQuoteQty);
+  if (exec > 0 && quote > 0) return quote / exec;
+  const fills = order.fills ?? [];
+  if (fills.length === 0) return null;
+  let qtySum = 0;
+  let quoteSum = 0;
+  for (const f of fills) {
+    const q = Number(f.qty);
+    const p = Number(f.price);
+    if (q > 0 && p > 0) {
+      qtySum += q;
+      quoteSum += q * p;
+    }
+  }
+  return qtySum > 0 ? quoteSum / qtySum : null;
+}
+
+/** Classic: dolu alış sonrası üst seviye SELL arm (maintain ile aynı mantık). */
+async function armSellAfterBuyFill(
+  env: Env,
+  gateway: TradingGateway,
+  cfg: GridConfig,
+  grid: GridStateRow,
+  buyLevelIndex: number,
+  buyQty: string,
+  buyPrice: string,
+  levels: number[],
+  lastPrice: number,
+  filters: ReturnType<typeof parseSymbolFilters>,
+): Promise<boolean> {
+  const next = nextOrderAfterFill(buyLevelIndex, 'BUY', levels, Number(grid.investment_usdt));
+  if (!next || next.side !== 'SELL') return false;
+  const price = makerSellPrice(next.price, lastPrice, filters.tickSize);
+  const qty = formatQuantity(buyQty, filters.stepSize);
+  const notional = bn(qty).times(price).toFixed(8);
+  if (!meetsMinQty(qty, filters.minQty) || !meetsMinNotional(notional, filters.minNotional)) {
+    await logEvent(env.DB, 'GRID_REARM_SKIP', {
+      symbol: grid.symbol,
+      gridId: grid.id,
+      levelIndex: next.levelIndex,
+      qty,
+      price,
+      notional,
+      minNotional: filters.minNotional,
+      context: 'setup_market_entry',
+    });
+    return false;
+  }
+  const buyCost = bn(buyQty).times(buyPrice).toFixed(8);
+  return placeGridOrder(
+    env,
+    gateway,
+    cfg,
+    grid.symbol,
+    grid.id,
+    next.levelIndex,
+    'SELL',
+    price,
+    qty,
+    buyCost,
+  );
+}
+
+/**
+ * Kurulumda bir seviye payı MARKET alım (grid_setup_market_entry).
+ * buyGuard atlanır; readiness kurulum öncesi geçilmiş sayılır.
+ */
+async function placeSetupMarketEntry(
+  env: Env,
+  gateway: TradingGateway,
+  cfg: GridConfig,
+  grid: GridStateRow,
+  symbol: string,
+  levels: number[],
+  lastPrice: number,
+  filters: ReturnType<typeof parseSymbolFilters>,
+  quotePerLevel: number,
+): Promise<boolean> {
+  const realMode = tradingEnabled(env) && cfg.liveGate;
+  const quoteStr = bn(quotePerLevel).toFixed(2);
+  let fillPrice: number;
+  let qtyStr: string;
+  let binanceOrderId: string;
+
+  if (realMode) {
+    let order: OrderResponse;
+    try {
+      order = await gateway.marketBuy(symbol, quoteStr);
+    } catch (err) {
+      await logEvent(env.DB, 'GRID_SETUP_MARKET_BUY_FAILED', {
+        symbol,
+        gridId: grid.id,
+        quoteUsdt: quoteStr,
+        ...serializeBinanceError(err),
+      });
+      return false;
+    }
+    const net = netQtyFromBuy(order, symbol);
+    qtyStr = formatQuantity(net.net_base_qty, filters.stepSize);
+    if (!meetsMinQty(qtyStr, filters.minQty)) {
+      await logEvent(env.DB, 'GRID_SETUP_MARKET_BUY_FAILED', {
+        symbol,
+        gridId: grid.id,
+        reason: 'qty_below_min',
+        qty: qtyStr,
+        minQty: filters.minQty,
+      });
+      return false;
+    }
+    fillPrice = avgFillPriceFromBuyOrder(order) ?? lastPrice;
+    const notional = bn(qtyStr).times(fillPrice).toFixed(8);
+    if (!meetsMinNotional(notional, filters.minNotional)) {
+      await logEvent(env.DB, 'GRID_SETUP_MARKET_BUY_FAILED', {
+        symbol,
+        gridId: grid.id,
+        reason: 'notional_below_min',
+        notional,
+        minNotional: filters.minNotional,
+      });
+      return false;
+    }
+    binanceOrderId = String(order.orderId);
+  } else {
+    const paperQty = buyQtyForGridLevel(quotePerLevel, lastPrice, filters);
+    if (!paperQty) {
+      await logEvent(env.DB, 'GRID_SETUP_MARKET_BUY_FAILED', {
+        symbol,
+        gridId: grid.id,
+        reason: 'paper_qty_invalid',
+        quoteUsdt: quoteStr,
+        lastPrice,
+      });
+      return false;
+    }
+    qtyStr = paperQty;
+    fillPrice = lastPrice;
+    binanceOrderId = `mock-market-${grid.id}-${Date.now()}`;
+  }
+
+  const levelIndex = nearestLevelIndex(fillPrice, levels);
+  const priceStr = formatPrice(String(fillPrice), filters.tickSize);
+
+  let orderId: number;
+  try {
+    orderId = await insertGridOrder(env.DB, {
+      gridId: grid.id,
+      levelIndex,
+      side: 'BUY',
+      price: priceStr,
+      qty: qtyStr,
+      binanceOrderId,
+    });
+    await markGridOrder(env.DB, orderId, 'FILLED');
+  } catch (err) {
+    await logEvent(env.DB, 'GRID_SETUP_MARKET_BUY_FAILED', {
+      symbol,
+      gridId: grid.id,
+      reason: 'db_insert_failed',
+      message: err instanceof Error ? err.message : String(err),
+      binanceOrderId,
+    });
+    return false;
+  }
+
+  await logEvent(env.DB, 'GRID_SETUP_MARKET_BUY', {
+    symbol,
+    gridId: grid.id,
+    quoteUsdt: quoteStr,
+    executedQty: qtyStr,
+    avgPrice: fillPrice,
+    levelIndex,
+    ladderMode: cfg.ladderMode,
+    realMode,
+  });
+
+  if (isBreakevenDip(cfg)) {
+    const floorSync = await syncFloorExitSell(env, gateway, cfg, grid, lastPrice, filters);
+    if (floorSync.changed) {
+      await logEvent(env.DB, 'GRID_FLOOR_EXIT_SYNC', {
+        symbol: grid.symbol,
+        gridId: grid.id,
+        action: floorSync.action,
+        price: floorSync.price,
+        qty: floorSync.qty,
+        avgCost: floorSync.avgCost,
+        context: 'setup_market_entry',
+      });
+    }
+  } else {
+    await armSellAfterBuyFill(
+      env,
+      gateway,
+      cfg,
+      grid,
+      levelIndex,
+      qtyStr,
+      priceStr,
+      levels,
+      lastPrice,
+      filters,
+    );
+  }
+
+  return true;
 }
 
 /** LIMIT_MAKER alış: fiyat her zaman güncel fiyatın ALTINDA olmalı (yoksa taker -> red). */
@@ -763,25 +1005,43 @@ async function deployGrid(
   });
 
   let placed = 0;
+  let marketEntryDone = false;
+  if (cfg.setupMarketEntry) {
+    marketEntryDone = await placeSetupMarketEntry(
+      env,
+      gateway,
+      cfg,
+      grid,
+      symbol,
+      levels,
+      lastPrice,
+      filters,
+      quotePerLevel,
+    );
+    if (marketEntryDone) placed++;
+  }
+
   if (isBreakevenDip(cfg)) {
-    const target = selectLadderBuyTarget(plan, false, new Set());
-    if (target) {
-      const price = makerBuyPrice(target.price, lastPrice, filters.tickSize);
-      const qty = buyQtyForGridLevel(quotePerLevel, Number(price), filters);
-      if (qty) {
-        const ok = await placeGridOrder(
-          env,
-          gateway,
-          cfg,
-          symbol,
-          grid.id,
-          target.levelIndex,
-          'BUY',
-          price,
-          qty,
-          null,
-        );
-        if (ok) placed++;
+    if (!marketEntryDone) {
+      const target = selectLadderBuyTarget(plan, false, new Set());
+      if (target) {
+        const price = makerBuyPrice(target.price, lastPrice, filters.tickSize);
+        const qty = buyQtyForGridLevel(quotePerLevel, Number(price), filters);
+        if (qty) {
+          const ok = await placeGridOrder(
+            env,
+            gateway,
+            cfg,
+            symbol,
+            grid.id,
+            target.levelIndex,
+            'BUY',
+            price,
+            qty,
+            null,
+          );
+          if (ok) placed++;
+        }
       }
     }
   } else {
@@ -818,12 +1078,18 @@ async function deployGrid(
     gridCount,
     spacingPct: spacing,
     buysPlaced: placed,
+    setupMarketEntry: cfg.setupMarketEntry,
+    marketEntryDone,
     investmentUsdt: cfg.investmentUsdt,
     live: tradingEnabled(env) && cfg.liveGate,
     mode: tradingEnabled(env) && cfg.liveGate ? 'live' : 'paper',
     parallelRecoveringGridId: parallelRecovering[0]?.id ?? null,
     allowNewGridWhileRecovering: cfg.allowNewGridWhileRecovering,
   });
+
+  const wl = await listWatchlist(env.DB);
+  const watchSymbols = [...new Set([...wl.map((w) => w.symbol), symbol])];
+  await ensureMarketDataWatchlist(env, watchSymbols);
 }
 
 async function placeGridOrder(
@@ -1055,11 +1321,24 @@ async function maintainGrid(
   gateway: TradingGateway,
   cfg: GridConfig,
   grid: GridStateRow,
+  defensiveMode: DefensiveMarketMode | null,
 ): Promise<void> {
   const lastPrice = await fetchLastPrice(gateway, grid.symbol);
   if (!lastPrice) return;
 
   await updateOpenGridSellExcursions(env.DB, grid.id, String(lastPrice));
+
+  if (defensiveMode?.active) {
+    const defensiveTeardown = await maybeDefensiveTeardownGrid(
+      env,
+      gateway,
+      cfg,
+      grid,
+      lastPrice,
+      defensiveMode,
+    );
+    if (defensiveTeardown) return;
+  }
 
   const lower = Number(grid.lower_price);
   const upper = Number(grid.upper_price);
@@ -1264,6 +1543,25 @@ async function maintainGrid(
         floorExit: isFloorExitOrder(order),
         ...cycleAnalytics,
       });
+      maintainBuyGuardByGridId.delete(grid.id);
+      if (needsBuyGuardAssessment(cfg)) {
+        const postCycleSnap = await buildBuyGuardAssessment(env, gateway, cfg, grid, lastPrice);
+        if (postCycleSnap) {
+          maintainBuyGuardByGridId.set(grid.id, postCycleSnap);
+          if (!postCycleSnap.readiness.ready) {
+            flashBuyBlockByGrid.set(grid.id, true);
+            await logEvent(env.DB, 'GRID_CYCLE_READINESS_HOLD', {
+              symbol: grid.symbol,
+              gridId: grid.id,
+              blocker: postCycleSnap.readiness.primaryBlocker,
+              score: Number(postCycleSnap.readiness.score.toFixed(2)),
+              gatesPassed: postCycleSnap.readiness.gates.filter((g) => g.pass).length,
+              gatesTotal: postCycleSnap.readiness.gates.length,
+              ...(cfg.buyLogAssessment ? buildAssessmentLogPayload(postCycleSnap) : {}),
+            });
+          }
+        }
+      }
       if (!isBreakevenDip(cfg) && next && next.side === 'BUY') {
         const price = makerBuyPrice(next.price, lastPrice, filters.tickSize);
         const quotePerLevel = Number(grid.investment_usdt) / grid.grid_count;
@@ -2202,6 +2500,7 @@ async function maintainRecovery(
   gateway: TradingGateway,
   cfg: GridConfig,
   grid: GridStateRow,
+  defensiveMode: DefensiveMarketMode | null,
 ): Promise<void> {
   const orderId = grid.recovery_order_id;
   const targetPrice = grid.recovery_target_price;
@@ -2244,6 +2543,33 @@ async function maintainRecovery(
     return;
   }
 
+  if (
+    defensiveMode?.active &&
+    !isGridDefensiveExempt(cfg, grid.id) &&
+    lastPrice != null &&
+    shouldStopRecoveryAtTarget(
+      lastPrice,
+      Number(targetPrice),
+      cfg.defensiveRecoveryStopPct,
+    )
+  ) {
+    await logEvent(env.DB, 'GRID_RECOVERY_DEFENSIVE_CONVERT', {
+      symbol: grid.symbol,
+      gridId: grid.id,
+      targetPrice,
+      lastPrice,
+      stopPct: cfg.defensiveRecoveryStopPct,
+      reasons: defensiveMode.reasons,
+    });
+    await convertRecoveryToUsdt(env, grid.id, { source: 'defensive_stop_loss' });
+    return;
+  }
+
+  if (lastPrice != null) {
+    const ladderRan = await maybeAutoExecuteRecoveryLadder(env, cfg, grid, lastPrice);
+    if (ladderRan) return;
+  }
+
   await logEvent(env.DB, 'GRID_RECOVERY_WAIT', {
     symbol: grid.symbol,
     gridId: grid.id,
@@ -2256,6 +2582,54 @@ async function maintainRecovery(
         ? (((Number(targetPrice) - lastPrice) / lastPrice) * 100).toFixed(3)
         : null,
   });
+}
+
+/**
+ * Savunma modu: muaf olmayan aktif gridleri recovery'ye al veya flat ise kapat.
+ */
+async function maybeDefensiveTeardownGrid(
+  env: Env,
+  gateway: TradingGateway,
+  cfg: GridConfig,
+  grid: GridStateRow,
+  lastPrice: number,
+  defensiveMode: DefensiveMarketMode,
+): Promise<boolean> {
+  if (!defensiveMode.active || isGridDefensiveExempt(cfg, grid.id)) return false;
+
+  const ageMs = Date.now() - dbTimestampMs(grid.created_at);
+  if (ageMs < GRID_TEARDOWN_GRACE_MS) return false;
+
+  const openOrders = await listGridOrders(env.DB, grid.id, 'OPEN');
+  const stats = await getGridFilledStats(env.DB, grid.id);
+  const netQty = stats.boughtQty - stats.soldQty;
+  const hasInventory = netQty > 0 && netQty * lastPrice >= GRID_INVENTORY_DUST_USDT;
+
+  if (hasInventory) {
+    await logEvent(env.DB, 'GRID_TEARDOWN_RECOVERY', {
+      symbol: grid.symbol,
+      gridId: grid.id,
+      blocker: 'defensive_mode',
+      reasons: defensiveMode.reasons,
+      netQty,
+      lastPrice,
+    });
+    await enterRecovery(env, gateway, cfg, grid, lastPrice, 'defensive_mode');
+    return true;
+  }
+
+  if (openOrders.length > 0) {
+    await cancelOpenGridOrders(env, gateway, cfg, grid);
+  }
+  await stopGrid(env.DB, grid.id, 'defensive_mode');
+  await logEvent(env.DB, 'GRID_TEARDOWN', {
+    symbol: grid.symbol,
+    gridId: grid.id,
+    blocker: 'defensive_mode',
+    reasons: defensiveMode.reasons,
+    lastPrice,
+  });
+  return true;
 }
 
 async function closeGrid(
