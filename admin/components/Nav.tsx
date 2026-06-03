@@ -7,6 +7,7 @@ import { clearSecret } from '@/lib/api';
 
 const links = [
   { href: '/', label: 'Dashboard' },
+  { href: '/dip-reversal/', label: 'Dip Reversal' },
   { href: '/binance-pnl/', label: 'Binance PnL' },
   { href: '/market-data/', label: 'Market verisi' },
   { href: '/logs/', label: 'Olaylar' },

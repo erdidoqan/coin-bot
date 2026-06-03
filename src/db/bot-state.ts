@@ -3,7 +3,12 @@ import { clearMockTrailingSim } from './mock-sim';
 
 export type BotStatus = 'IDLE' | 'TIER_1_BULL' | 'MANUAL_INTERVENTION' | 'ERROR';
 
-export type EntryMode = 'pullback' | 'momentum_scalp' | 'micro_scalp' | 'tick_scalp';
+export type EntryMode =
+  | 'pullback'
+  | 'momentum_scalp'
+  | 'micro_scalp'
+  | 'tick_scalp'
+  | 'dip_reversal';
 
 export interface BotState {
   id: number;

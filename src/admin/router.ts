@@ -29,6 +29,7 @@ import {
 } from '../jobs/recovery-ladder';
 import { enrichWatchlistLive, formatWatchlistForAdmin } from './watchlist-enrich';
 import { fetchMarketDataStatus } from '../exchange/market-data-client';
+import { buildDipReversalReport } from './dip-reversal-status';
 import { buildTickLiveReport } from './tick-live';
 import {
   buildGridStatus,
@@ -134,6 +135,23 @@ const CONFIG_KEYS: BotConfigKey[] = [
   'grid_readiness_lookback',
   'grid_exclude_symbols',
   'grid_max_concurrent',
+  // --- Dip Reversal Sniper (bağımsız strateji) ---
+  'dip_reversal_enabled',
+  'dip_reversal_buy_quote_usdt',
+  'dip_reversal_max_concurrent',
+  'dip_reversal_min_capitulation_drop_pct',
+  'dip_reversal_flash_window_min',
+  'dip_reversal_min_ws_decline_pct',
+  'dip_reversal_min_recovery_from_low_pct',
+  'dip_reversal_min_reversal_score',
+  'dip_reversal_max_sec_since_trough',
+  'dip_reversal_require_mid_slope',
+  'dip_reversal_trailing_activation_pct',
+  'dip_reversal_trailing_callback_pct',
+  'dip_reversal_hard_stop_pct',
+  'dip_reversal_max_hold_min',
+  'dip_reversal_post_exit_cooldown_min',
+  'dip_reversal_regime_filter',
 ];
 
 function isConfigKey(key: string): key is BotConfigKey {
@@ -343,6 +361,11 @@ export async function handleAdminApi(request: Request, env: Env): Promise<Respon
         available: Boolean(env.MARKET_DATA),
         status,
       });
+    }
+
+    if (path === '/dip-reversal' && request.method === 'GET') {
+      const report = await buildDipReversalReport(env);
+      return jsonResponse(request, report);
     }
 
     if (path === '/tick-live' && request.method === 'GET') {

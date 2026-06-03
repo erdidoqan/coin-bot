@@ -212,6 +212,23 @@ export type BotConfigKey =
   | 'grid_defensive_exempt_initialized'
   | 'grid_setup_market_entry'
   | 'grid_run_lock'
+  // --- Dip Reversal Sniper (bağımsız strateji; düşüşte al + native trailing sat) ---
+  | 'dip_reversal_enabled'
+  | 'dip_reversal_buy_quote_usdt'
+  | 'dip_reversal_max_concurrent'
+  | 'dip_reversal_min_capitulation_drop_pct'
+  | 'dip_reversal_flash_window_min'
+  | 'dip_reversal_min_ws_decline_pct'
+  | 'dip_reversal_min_recovery_from_low_pct'
+  | 'dip_reversal_min_reversal_score'
+  | 'dip_reversal_max_sec_since_trough'
+  | 'dip_reversal_require_mid_slope'
+  | 'dip_reversal_trailing_activation_pct'
+  | 'dip_reversal_trailing_callback_pct'
+  | 'dip_reversal_hard_stop_pct'
+  | 'dip_reversal_max_hold_min'
+  | 'dip_reversal_post_exit_cooldown_min'
+  | 'dip_reversal_regime_filter'
 
 const ENV_FALLBACK: Partial<Record<BotConfigKey, keyof Env>> = {
   hard_stop_loss_pct: 'HARD_STOP_LOSS_PCT',
@@ -433,6 +450,27 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   grid_defensive_exempt_initialized: 'false',
   grid_setup_market_entry: 'false',
   grid_run_lock: '0',
+  // --- Dip Reversal Sniper (varsayılan kapalı; canlı gözleme göre kalibre) ---
+  dip_reversal_enabled: 'false',
+  dip_reversal_buy_quote_usdt: '30',
+  dip_reversal_max_concurrent: '3',
+  dip_reversal_min_capitulation_drop_pct: '1.0',
+  dip_reversal_flash_window_min: '10',
+  dip_reversal_min_ws_decline_pct: '0.4',
+  dip_reversal_min_recovery_from_low_pct: '0.15',
+  dip_reversal_min_reversal_score: '1.0',
+  dip_reversal_max_sec_since_trough: '90',
+  dip_reversal_require_mid_slope: 'true',
+  dip_reversal_trailing_activation_pct: '0.5',
+  dip_reversal_trailing_callback_pct: '0.3',
+  dip_reversal_hard_stop_pct: '2',
+  dip_reversal_max_hold_min: '40',
+  dip_reversal_post_exit_cooldown_min: '30',
+  // Boş = rejim kapısı kapalı. DO rejimi breadth ölçek uyuşmazlığı yüzünden
+  // neredeyse hep 'trend' döndürür; bu yüzden filtre açık olsaydı savunma modunda
+  // (asıl fırsat penceresi) tüm girişleri bloklardı. Giriş kararı saf dip+bounce
+  // sinyaline bırakıldı; piyasa takibi (WS tarama) yine çalışır.
+  dip_reversal_regime_filter: '',
 };
 
 export async function getConfig(

@@ -17,6 +17,28 @@ interface Group {
 
 const GROUPS: Group[] = [
   {
+    title: 'Dip Reversal Sniper (bağımsız strateji)',
+    desc: 'Yüksek dalgalı düşüşte capitulation dip + bounce onayı ile al, native trailing ile sat. Grid\'den izole; grid\'in aktif/recovering sembollerine girmez.',
+    fields: [
+      { key: 'dip_reversal_enabled', label: 'Dip Reversal aktif (true/false) — CANLI gerçek emir' },
+      { key: 'dip_reversal_buy_quote_usdt', label: 'İşlem başına alım (USDT)' },
+      { key: 'dip_reversal_max_concurrent', label: 'Eşzamanlı max pozisyon' },
+      { key: 'dip_reversal_min_capitulation_drop_pct', label: 'Min capitulation düşüşü % (flash windowDrop)' },
+      { key: 'dip_reversal_flash_window_min', label: 'Flash pencere (dk, 5m kapanış)' },
+      { key: 'dip_reversal_min_ws_decline_pct', label: 'Min WS tick düşüşü % (dip oldu mu)' },
+      { key: 'dip_reversal_min_recovery_from_low_pct', label: 'Min diptan toparlanma % (bounce)' },
+      { key: 'dip_reversal_min_reversal_score', label: 'Min reversal skoru' },
+      { key: 'dip_reversal_max_sec_since_trough', label: 'Dipten max geçen süre (sn)' },
+      { key: 'dip_reversal_require_mid_slope', label: 'Yükselen mid eğimi şart (true/false)' },
+      { key: 'dip_reversal_trailing_activation_pct', label: 'Trailing aktivasyon % (stopPrice = avgCost*(1+%))' },
+      { key: 'dip_reversal_trailing_callback_pct', label: 'Trailing callback % (trailingDelta)' },
+      { key: 'dip_reversal_hard_stop_pct', label: 'Hard-stop zarar % (bag koruması)' },
+      { key: 'dip_reversal_max_hold_min', label: 'Zaman-stop: max tutma (dk, kârda değilse çık; 0=kapalı)' },
+      { key: 'dip_reversal_post_exit_cooldown_min', label: 'Çıkış sonrası bekleme (dk)' },
+      { key: 'dip_reversal_regime_filter', label: 'İzinli rejimler (CSV, örn. panic,chop; boş=hepsi)' },
+    ],
+  },
+  {
     title: 'Strateji & Genel',
     fields: [
       { key: 'grid_enabled', label: 'Grid aktif (true/false)' },
