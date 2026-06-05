@@ -6,9 +6,14 @@ import { runGridMaintenance, recoverAllActiveGrids, forceRecenterGrid } from './
 import { runGridScout } from './jobs/grid-scout';
 import { runGridSweep } from './jobs/grid-sweep';
 import { runDustConvert } from './jobs/dust-convert';
-import { runDipReversalSniper } from './jobs/dip-reversal-sniper';
+import {
+  prepareDipReversalAdaptSnapshot,
+  runDipReversalSniper,
+} from './jobs/dip-reversal-sniper';
+import { getDipReversalConfig } from './db/dip-reversal';
 import { runDipReversalReconcile } from './jobs/dip-reversal-reconcile';
 import { TradingGateway } from './exchange/gateway';
+import { isBinanceRateLimitError } from './exchange/order-errors';
 import { logEvent } from './db/trade-log';
 import { getBotState } from './db/bot-state';
 import { isTickScalpEnabled, getConfig } from './db/bot-config';
@@ -48,22 +53,71 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function runDipReversalTick(env: Env, cron: string): Promise<void> {
-  if (cron === '*/15 * * * *') return;
+async function runDipReversalCycle(
+  env: Env,
+  opts?: { singlePass?: boolean },
+): Promise<void> {
   const gateway = new TradingGateway(env);
+  const cfg = await getDipReversalConfig(env.DB, env);
+  let adaptSnapshot: Awaited<ReturnType<typeof prepareDipReversalAdaptSnapshot>> = null;
+  let blockNewEntries = false;
+  let errorLogged = false;
+  let entryBlockLogged = false;
+
+  const logEntryBlocked = async (reason: string, phase: string): Promise<void> => {
+    if (entryBlockLogged) return;
+    entryBlockLogged = true;
+    await logEvent(env.DB, 'DIP_REVERSAL_ENTRY_BLOCKED', { reason, phase });
+  };
+
+  const handleDipError = async (err: unknown, phase: string): Promise<void> => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!errorLogged) {
+      await logEvent(env.DB, 'DIP_REVERSAL_ERROR', { message, phase });
+      errorLogged = true;
+    }
+    if (isBinanceRateLimitError(err)) {
+      blockNewEntries = true;
+      await logEntryBlocked('binance_rate_limit', phase);
+    }
+  };
+
+  try {
+    adaptSnapshot = await prepareDipReversalAdaptSnapshot(env, cfg);
+  } catch (err) {
+    await handleDipError(err, 'adapt_context');
+  }
+
+  if (cfg.adapt.enabled && adaptSnapshot === null) {
+    blockNewEntries = true;
+    await logEntryBlocked('adapt_context_missing', 'minute_start');
+  }
+
   const start = Date.now();
   for (;;) {
     try {
       await runDipReversalReconcile(env, gateway);
-      await runDipReversalSniper(env, gateway);
     } catch (err) {
-      await logEvent(env.DB, 'DIP_REVERSAL_ERROR', {
-        message: err instanceof Error ? err.message : String(err),
-      });
+      await handleDipError(err, 'reconcile');
     }
+
+    if (!blockNewEntries) {
+      try {
+        await runDipReversalSniper(env, gateway, adaptSnapshot);
+      } catch (err) {
+        await handleDipError(err, 'sniper');
+      }
+    }
+
+    if (opts?.singlePass) break;
     if (Date.now() - start + DIP_TICK_GAP_MS > DIP_TICK_BUDGET_MS) break;
     await sleep(DIP_TICK_GAP_MS);
   }
+}
+
+async function runDipReversalTick(env: Env, cron: string): Promise<void> {
+  if (cron === '*/15 * * * *') return;
+  await runDipReversalCycle(env);
 }
 
 /**
@@ -159,12 +213,9 @@ export async function runManualJob(env: Env, job: ManualJob): Promise<void> {
     case 'dust-convert':
       await runDustConvert(env);
       break;
-    case 'dip-reversal': {
-      const gateway = new TradingGateway(env);
-      await runDipReversalReconcile(env, gateway);
-      await runDipReversalSniper(env, gateway);
+    case 'dip-reversal':
+      await runDipReversalCycle(env, { singlePass: true });
       break;
-    }
     case 'grid-recover-active':
       await recoverAllActiveGrids(env);
       break;

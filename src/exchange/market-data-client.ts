@@ -1,6 +1,7 @@
 /** Worker → MarketDataDO RPC istemcisi */
 
-import type { Kline, Ticker24hr } from './binance';
+import { BinanceClient, type Kline, type Ticker24hr } from './binance';
+import { closedCandlesOnly } from '../indicators/technical';
 import type { MarketDataStatus } from '../durable-objects/market-data-do';
 import type { MarketRegimeResult } from '../indicators/market-regime';
 import type { MicroScalpConfig } from '../indicators/micro-scalp';
@@ -173,6 +174,54 @@ export async function fetchReadinessKlines(
   return raw && raw.length >= 20 ? raw : null;
 }
 
+const BTC_SYMBOL = 'BTCUSDT';
+/** EMA21 + ATR14 için kapalı 15m mum sayısı. */
+export const MIN_BTC_15M_CLOSED_BARS = 22;
+
+export async function seedKlinesToDo(
+  env: Env,
+  symbol: string,
+  interval: '1m' | '5m' | '15m',
+  klines: Kline[],
+): Promise<void> {
+  const stub = marketDataStub(env);
+  if (!stub || klines.length === 0) return;
+  try {
+    await stub.fetch('https://do.internal/seed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol, interval, klines }),
+    });
+  } catch {
+    /* DO seed en iyi çaba */
+  }
+}
+
+/** Dip rejim adaptasyonu: DO boşsa (deploy sonrası) REST ile BTC 15m tamamlar ve DO'ya yazar. */
+export async function fetchBtc15mKlinesForAdapt(env: Env): Promise<Kline[] | null> {
+  const sufficient = (kl: Kline[]) => closedCandlesOnly(kl).length >= MIN_BTC_15M_CLOSED_BARS;
+
+  let raw = await fetchKlinesFromDo(env, BTC_SYMBOL, '15m', 30);
+  if (raw && sufficient(raw)) return raw;
+
+  try {
+    const client = new BinanceClient(env);
+    const rest = await client.getKlines(BTC_SYMBOL, '15m', 30);
+    if (sufficient(rest)) {
+      await seedKlinesToDo(env, BTC_SYMBOL, '15m', rest);
+      return rest;
+    }
+    if (!raw || rest.length > raw.length) raw = rest;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/request weight|IP banned|too many requests/i.test(msg)) {
+      return raw && raw.length > 0 ? raw : null;
+    }
+  }
+
+  return raw && sufficient(raw) ? raw : null;
+}
+
 export async function fetchKlinesFromDo(
   env: Env,
   symbol: string,
@@ -191,10 +240,15 @@ export async function fetchKlinesFromDo(
   return body.ready ? body.klines : body.klines.length > 0 ? body.klines : null;
 }
 
-export async function fetchTickersFromDo(env: Env): Promise<Ticker24hr[] | null> {
+export async function fetchTickersFromDo(
+  env: Env,
+  opts?: { scope?: 'watchlist' },
+): Promise<Ticker24hr[] | null> {
   const stub = marketDataStub(env);
   if (!stub) return null;
-  const res = await stub.fetch('https://do.internal/tickers');
+  const url = new URL('https://do.internal/tickers');
+  if (opts?.scope === 'watchlist') url.searchParams.set('scope', 'watchlist');
+  const res = await stub.fetch(url.toString());
   if (!res.ok) return null;
   const body = await res.json<{ tickers: Ticker24hr[] }>();
   return body.tickers;

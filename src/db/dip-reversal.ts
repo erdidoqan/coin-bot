@@ -6,6 +6,18 @@
  * koruması. Grid'den tamamen izole (kendi entry_mode='dip_reversal').
  */
 import { getConfig } from './bot-config';
+import type { DipReversalAdaptThresholds } from '../strategy/dip-reversal-adapt';
+
+export type DipReversalDowntrendAdaptMode = 'tighten' | 'block';
+
+export interface DipReversalAdaptConfig {
+  enabled: boolean;
+  downtrendMode: DipReversalDowntrendAdaptMode;
+  /** downtrend_volatile + breadth altında sniper girişi durdur. */
+  volatileBlockEnabled: boolean;
+  volatileBlockBreadthMax: number;
+  thresholds: DipReversalAdaptThresholds;
+}
 
 export interface DipReversalConfig {
   enabled: boolean;
@@ -39,6 +51,8 @@ export interface DipReversalConfig {
   postExitCooldownMin: number;
   /** İzin verilen rejimler (CSV → liste; boş = tüm rejimler). */
   regimeFilter: string[];
+  /** Rejim-adaptasyon (opt-in; varsayılan kapalı). */
+  adapt: DipReversalAdaptConfig;
 }
 
 function num(value: string, fallback: number, min?: number): number {
@@ -68,6 +82,21 @@ export async function getDipReversalConfig(
     maxHoldMin,
     postExitCooldownMin,
     regimeFilter,
+    adaptEnabled,
+    adaptDowntrendMode,
+    adaptEmaMinSep,
+    adaptCalmAtrMax,
+    adaptVolatileAtrMin,
+    adaptDowntrendBreadthMax,
+    adaptCalmDropMult,
+    adaptDtVolDropMult,
+    adaptDtVolReversalMult,
+    adaptDtVolRecoveryMult,
+    adaptDtGrindDropMult,
+    adaptDtGrindReversalMult,
+    adaptDtGrindRecoveryMult,
+    adaptVolatileBlockEnabled,
+    adaptVolatileBlockBreadthMax,
   ] = await Promise.all([
     getConfig(db, 'dip_reversal_enabled', env),
     getConfig(db, 'dip_reversal_buy_quote_usdt', env),
@@ -85,7 +114,26 @@ export async function getDipReversalConfig(
     getConfig(db, 'dip_reversal_max_hold_min', env),
     getConfig(db, 'dip_reversal_post_exit_cooldown_min', env),
     getConfig(db, 'dip_reversal_regime_filter', env),
+    getConfig(db, 'dip_reversal_adapt_enabled', env),
+    getConfig(db, 'dip_reversal_adapt_downtrend_mode', env),
+    getConfig(db, 'dip_reversal_adapt_ema_min_sep_pct', env),
+    getConfig(db, 'dip_reversal_adapt_calm_atr_max', env),
+    getConfig(db, 'dip_reversal_adapt_volatile_atr_min', env),
+    getConfig(db, 'dip_reversal_adapt_downtrend_breadth_max', env),
+    getConfig(db, 'dip_reversal_adapt_calm_drop_mult', env),
+    getConfig(db, 'dip_reversal_adapt_dtvol_drop_mult', env),
+    getConfig(db, 'dip_reversal_adapt_dtvol_reversal_mult', env),
+    getConfig(db, 'dip_reversal_adapt_dtvol_recovery_mult', env),
+    getConfig(db, 'dip_reversal_adapt_dtgrind_drop_mult', env),
+    getConfig(db, 'dip_reversal_adapt_dtgrind_reversal_mult', env),
+    getConfig(db, 'dip_reversal_adapt_dtgrind_recovery_mult', env),
+    getConfig(db, 'dip_reversal_adapt_volatile_block_enabled', env),
+    getConfig(db, 'dip_reversal_adapt_volatile_block_breadth_max', env),
   ]);
+
+  const downtrendModeRaw = adaptDowntrendMode.trim().toLowerCase();
+  const downtrendMode: DipReversalDowntrendAdaptMode =
+    downtrendModeRaw === 'block' ? 'block' : 'tighten';
 
   return {
     enabled: enabled === 'true',
@@ -95,7 +143,7 @@ export async function getDipReversalConfig(
     flashWindowMin: Math.max(5, Math.round(num(flashWindowMin, 10, 5))),
     minWsDeclinePct: num(minWsDeclinePct, 0.4, 0),
     minRecoveryFromLowPct: num(minRecoveryFromLowPct, 0.15, 0),
-    minReversalScore: num(minReversalScore, 6, 0),
+    minReversalScore: num(minReversalScore, 1.0, 0),
     maxSecSinceTrough: Math.max(1, Math.round(num(maxSecSinceTrough, 90, 1))),
     requireMidSlope: requireMidSlope !== 'false',
     trailingActivationPct,
@@ -107,5 +155,24 @@ export async function getDipReversalConfig(
       .split(',')
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
+    adapt: {
+      enabled: adaptEnabled === 'true',
+      downtrendMode,
+      volatileBlockEnabled: adaptVolatileBlockEnabled !== 'false',
+      volatileBlockBreadthMax: num(adaptVolatileBlockBreadthMax, 10, 0),
+      thresholds: {
+        emaMinSepPct: num(adaptEmaMinSep, 0.1, 0),
+        calmAtrMax: num(adaptCalmAtrMax, 0.5, 0),
+        volatileAtrMin: num(adaptVolatileAtrMin, 1.0, 0),
+        downtrendBreadthMax: num(adaptDowntrendBreadthMax, 40, 0),
+        calmDropMult: num(adaptCalmDropMult, 0.7, 0),
+        dtVolDropMult: num(adaptDtVolDropMult, 1.15, 0),
+        dtVolReversalMult: num(adaptDtVolReversalMult, 1.25, 0),
+        dtVolRecoveryMult: num(adaptDtVolRecoveryMult, 1.25, 0),
+        dtGrindDropMult: num(adaptDtGrindDropMult, 1.4, 0),
+        dtGrindReversalMult: num(adaptDtGrindReversalMult, 1.6, 0),
+        dtGrindRecoveryMult: num(adaptDtGrindRecoveryMult, 1.6, 0),
+      },
+    },
   };
 }

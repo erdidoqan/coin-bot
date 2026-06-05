@@ -236,7 +236,7 @@ export class MarketDataDO extends DurableObject<Env> {
     if (url.pathname === '/tickers') {
       const scope = url.searchParams.get('scope');
       if (scope === 'watchlist') {
-        await this.refreshWatchlistTickers24h(this.symbols);
+        await this.refreshWatchlistTickers24hIfStale(this.symbols);
       } else if (this.tickers.size < 400 || this.tickersMissing24hRange()) {
         await this.refreshAllTickers24hRest();
       }
@@ -376,7 +376,8 @@ export class MarketDataDO extends DurableObject<Env> {
       .map((s) => s.toUpperCase())
       .filter((s) => s.endsWith('USDT'))
       .slice(0, MAX_SYMBOLS);
-    this.symbols = [...new Set([...normalized, BTC_SYMBOL])].slice(0, MAX_SYMBOLS);
+    const rest = normalized.filter((s) => s !== BTC_SYMBOL);
+    this.symbols = [BTC_SYMBOL, ...new Set(rest)].slice(0, MAX_SYMBOLS);
 
     for (const s of this.symbols) {
       if (!this.obMetrics.has(s)) {
@@ -792,6 +793,13 @@ export class MarketDataDO extends DurableObject<Env> {
     };
   }
 
+  /** Panel/adapt sık çağırır; tam /ticker/24hr en fazla dakikada bir. */
+  private async refreshWatchlistTickers24hIfStale(symbols: string[]): Promise<void> {
+    if (symbols.length === 0) return;
+    if (Date.now() - this.tickerRestAt < 60_000) return;
+    await this.refreshWatchlistTickers24h(symbols);
+  }
+
   private async refreshWatchlistTickers24h(symbols: string[]): Promise<void> {
     if (symbols.length === 0) return;
     const base = this.env.BINANCE_BASE_URL ?? 'https://api.binance.com';
@@ -879,7 +887,7 @@ export class MarketDataDO extends DurableObject<Env> {
     }
     const btcKlines = this.klines.getForScoring(BTC_SYMBOL, '15m', 30);
     const breadthSymbols = watchlistSymbols.length > 0 ? watchlistSymbols : this.symbols;
-    await this.refreshWatchlistTickers24h(breadthSymbols);
+    await this.refreshWatchlistTickers24hIfStale(breadthSymbols);
     const tickers: Ticker24hr[] = [];
     for (const sym of breadthSymbols) {
       const t = this.tickers.get(sym);

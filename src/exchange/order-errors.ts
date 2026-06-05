@@ -42,6 +42,18 @@ export function isOrderGoneError(err: unknown): boolean {
  * İptal çağrısında beklenen hatalar (emir yok / zaten dolmuş → iptal reddi).
  * Yine de GRID_BINANCE_API_WARN ile loglanır.
  */
+/** REST weight / IP ban / 418–429 — yeni girişleri durdurmak için. */
+export function isBinanceRateLimitError(err: unknown): boolean {
+  if (err instanceof BinanceApiError) {
+    if (err.status === 418 || err.status === 429) return true;
+    if (err.code === -1003) return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return /request weight|IP banned|too many requests|status code 418|status code 429/i.test(
+    msg,
+  );
+}
+
 export function isBenignCancelError(err: unknown): boolean {
   if (isOrderGoneError(err)) return true;
   const msg = err instanceof Error ? err.message : String(err);

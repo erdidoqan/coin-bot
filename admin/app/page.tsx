@@ -345,26 +345,19 @@ export default function DashboardPage() {
     };
   }, [applyGridLive]);
 
-  // Aday uygunluk: DO fiyat/spread ~1 sn; tam regime REST ~30 sn (canlıda regime_cache kapısı).
+  // Aday uygunluk: düşük öncelik — regime_cache ile ~15 sn (grid-live 1 sn ayrı).
   useEffect(() => {
-    const LIVE_MS = 1_000;
-    const MARKET_MS = 30_000;
+    const CANDIDATE_MS = 15_000;
     let cancelled = false;
-    const tickLive = () => {
+    const tick = () => {
       if (cancelled || document.visibilityState === 'hidden') return;
       loadCandidates({ live: true }).catch(() => {});
     };
-    const tickMarket = () => {
-      if (cancelled || document.visibilityState === 'hidden') return;
-      loadCandidates({ live: false }).catch(() => {});
-    };
-    tickLive();
-    const liveIv = setInterval(tickLive, LIVE_MS);
-    const marketIv = setInterval(tickMarket, MARKET_MS);
+    tick();
+    const iv = setInterval(tick, CANDIDATE_MS);
     return () => {
       cancelled = true;
-      clearInterval(liveIv);
-      clearInterval(marketIv);
+      clearInterval(iv);
     };
   }, [loadCandidates]);
 

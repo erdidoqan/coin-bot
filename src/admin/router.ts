@@ -29,7 +29,12 @@ import {
 } from '../jobs/recovery-ladder';
 import { enrichWatchlistLive, formatWatchlistForAdmin } from './watchlist-enrich';
 import { fetchMarketDataStatus } from '../exchange/market-data-client';
-import { buildDipReversalReport } from './dip-reversal-status';
+import {
+  buildDipReversalLive,
+  buildDipReversalPositionsLive,
+  buildDipReversalReport,
+} from './dip-reversal-status';
+import { manualDipReversalBuy } from '../jobs/dip-reversal-sniper';
 import { buildTickLiveReport } from './tick-live';
 import {
   buildGridStatus,
@@ -152,6 +157,21 @@ const CONFIG_KEYS: BotConfigKey[] = [
   'dip_reversal_max_hold_min',
   'dip_reversal_post_exit_cooldown_min',
   'dip_reversal_regime_filter',
+  'dip_reversal_adapt_enabled',
+  'dip_reversal_adapt_downtrend_mode',
+  'dip_reversal_adapt_ema_min_sep_pct',
+  'dip_reversal_adapt_calm_atr_max',
+  'dip_reversal_adapt_volatile_atr_min',
+  'dip_reversal_adapt_downtrend_breadth_max',
+  'dip_reversal_adapt_calm_drop_mult',
+  'dip_reversal_adapt_dtvol_drop_mult',
+  'dip_reversal_adapt_dtvol_reversal_mult',
+  'dip_reversal_adapt_dtvol_recovery_mult',
+  'dip_reversal_adapt_dtgrind_drop_mult',
+  'dip_reversal_adapt_dtgrind_reversal_mult',
+  'dip_reversal_adapt_dtgrind_recovery_mult',
+  'dip_reversal_adapt_volatile_block_enabled',
+  'dip_reversal_adapt_volatile_block_breadth_max',
 ];
 
 function isConfigKey(key: string): key is BotConfigKey {
@@ -363,9 +383,29 @@ export async function handleAdminApi(request: Request, env: Env): Promise<Respon
       });
     }
 
+    if (path === '/dip-reversal/live' && request.method === 'GET') {
+      const report = await buildDipReversalLive(env);
+      return jsonResponse(request, report);
+    }
+
+    if (path === '/dip-reversal/positions-live' && request.method === 'GET') {
+      const report = await buildDipReversalPositionsLive(env);
+      return jsonResponse(request, report);
+    }
+
     if (path === '/dip-reversal' && request.method === 'GET') {
       const report = await buildDipReversalReport(env);
       return jsonResponse(request, report);
+    }
+
+    if (path === '/dip-reversal/manual-buy' && request.method === 'POST') {
+      const body = (await request.json()) as { symbol?: string };
+      const symbol = body.symbol?.trim();
+      if (!symbol) {
+        return jsonResponse(request, { ok: false, error: 'symbol_required' }, 400);
+      }
+      const result = await manualDipReversalBuy(env, symbol);
+      return jsonResponse(request, result, result.ok ? 200 : 400);
     }
 
     if (path === '/tick-live' && request.method === 'GET') {

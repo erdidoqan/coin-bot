@@ -229,6 +229,21 @@ export type BotConfigKey =
   | 'dip_reversal_max_hold_min'
   | 'dip_reversal_post_exit_cooldown_min'
   | 'dip_reversal_regime_filter'
+  | 'dip_reversal_adapt_enabled'
+  | 'dip_reversal_adapt_downtrend_mode'
+  | 'dip_reversal_adapt_ema_min_sep_pct'
+  | 'dip_reversal_adapt_calm_atr_max'
+  | 'dip_reversal_adapt_volatile_atr_min'
+  | 'dip_reversal_adapt_downtrend_breadth_max'
+  | 'dip_reversal_adapt_calm_drop_mult'
+  | 'dip_reversal_adapt_dtvol_drop_mult'
+  | 'dip_reversal_adapt_dtvol_reversal_mult'
+  | 'dip_reversal_adapt_dtvol_recovery_mult'
+  | 'dip_reversal_adapt_dtgrind_drop_mult'
+  | 'dip_reversal_adapt_dtgrind_reversal_mult'
+  | 'dip_reversal_adapt_dtgrind_recovery_mult'
+  | 'dip_reversal_adapt_volatile_block_enabled'
+  | 'dip_reversal_adapt_volatile_block_breadth_max'
 
 const ENV_FALLBACK: Partial<Record<BotConfigKey, keyof Env>> = {
   hard_stop_loss_pct: 'HARD_STOP_LOSS_PCT',
@@ -471,6 +486,21 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   // (asıl fırsat penceresi) tüm girişleri bloklardı. Giriş kararı saf dip+bounce
   // sinyaline bırakıldı; piyasa takibi (WS tarama) yine çalışır.
   dip_reversal_regime_filter: '',
+  dip_reversal_adapt_enabled: 'false',
+  dip_reversal_adapt_downtrend_mode: 'tighten',
+  dip_reversal_adapt_ema_min_sep_pct: '0.1',
+  dip_reversal_adapt_calm_atr_max: '0.5',
+  dip_reversal_adapt_volatile_atr_min: '1.0',
+  dip_reversal_adapt_downtrend_breadth_max: '40',
+  dip_reversal_adapt_calm_drop_mult: '0.7',
+  dip_reversal_adapt_dtvol_drop_mult: '1.15',
+  dip_reversal_adapt_dtvol_reversal_mult: '1.25',
+  dip_reversal_adapt_dtvol_recovery_mult: '1.25',
+  dip_reversal_adapt_dtgrind_drop_mult: '1.4',
+  dip_reversal_adapt_dtgrind_reversal_mult: '1.6',
+  dip_reversal_adapt_dtgrind_recovery_mult: '1.6',
+  dip_reversal_adapt_volatile_block_enabled: 'true',
+  dip_reversal_adapt_volatile_block_breadth_max: '10',
 };
 
 export async function getConfig(
