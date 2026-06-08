@@ -5,7 +5,7 @@
  * çevirir. Aktif/recovering grid'i olan semboller dönüşümün DIŞINDA tutulur (çalışan
  * envantere dokunulmasın). BNB ve stable zaten dust listesine girmez.
  */
-import { getActiveGrids, getRecoveringGrids } from '../db/grid';
+import { listOpenPositions } from '../db/open-positions';
 import { logEvent } from '../db/trade-log';
 import { BinanceClient } from '../exchange/binance';
 
@@ -28,10 +28,9 @@ export async function runDustConvert(env: Env): Promise<DustConvertResult> {
   }
 
   const client = new BinanceClient(env);
-  const [list, actives, recovering] = await Promise.all([
+  const [list, openPositions] = await Promise.all([
     client.getDustList().catch(() => null),
-    getActiveGrids(env.DB),
-    getRecoveringGrids(env.DB),
+    listOpenPositions(env.DB),
   ]);
 
   if (!list || !list.details?.length) {
@@ -39,9 +38,9 @@ export async function runDustConvert(env: Env): Promise<DustConvertResult> {
     return { ok: true, converted: 0, bnbReceived: '0', assets: [], message: 'no_dust' };
   }
 
-  // Çalışan grid sembollerinin base varlıklarını dönüşüm dışı bırak.
+  // Açık pozisyonların base varlıklarını dönüşüm dışı bırak (satılmamış pozisyon).
   const busyAssets = new Set<string>(
-    [...actives, ...recovering].map((g) => g.symbol.replace(/USDT$/, '')),
+    openPositions.map((p) => p.symbol.replace(/USDT$/, '')),
   );
   const ignore = new Set(['LUNC']);
   const assets = list.details.map((d) => d.asset).filter((a) => !busyAssets.has(a) && !ignore.has(a));

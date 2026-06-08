@@ -14,7 +14,6 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    // Grid modunda scout/DO-WS çalışmaz; runScheduled içinde yönlendirilir.
     ctx.waitUntil(runScheduled(env, controller.cron));
   },
 
@@ -67,17 +66,7 @@ export default {
         return Response.json(
           {
             error: 'Invalid job',
-            valid: [
-              'scout',
-              'sniper',
-              'reconcile',
-              'tick',
-              'grid',
-              'grid-sweep',
-              'dust-convert',
-              'grid-recover-active',
-              'all',
-            ],
+            valid: ['scout', 'sniper', 'reconcile', 'tick', 'dust-convert', 'dip-reversal', 'all'],
           },
           { status: 400 },
         );

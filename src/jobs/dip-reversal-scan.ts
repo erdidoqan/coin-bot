@@ -23,8 +23,7 @@ import {
   type DipReversalMode,
 } from '../strategy/dip-reversal-adapt';
 import type { DipReversalAdaptSnapshot } from './dip-reversal-context';
-import { windowDropPctFromCloses } from '../strategy/grid-flash-drop';
-import { rollingReturnPct } from '../strategy/grid-readiness';
+import { windowDropPctFromCloses, rollingReturnPct } from '../strategy/price-windows';
 import { isSystemTradeBlockedSymbol } from '../config/system-trade-rules';
 import { bn } from '../math/decimal';
 
@@ -213,19 +212,6 @@ export function resolvePanelMode(opts: DipReversalScanOpts): DipReversalPanelMod
   return 'full';
 }
 
-export async function gridHeldSymbols(db: D1Database): Promise<Set<string>> {
-  const { results } = await db
-    .prepare("SELECT DISTINCT symbol FROM grid_state WHERE status IN ('ACTIVE','RECOVERING')")
-    .all<{ symbol: string }>();
-  const held = new Set((results ?? []).map((r) => r.symbol));
-  // Grid alımdan sonra trailing'e devredilince grid_state STOPPED olur ama pozisyon
-  // entry_mode='grid' olarak açık kalır; bu sembolleri de grid-held say (dip-reversal
-  // sniper aynı sembole girmesin, open_positions UNIQUE(symbol) ihlali olmasın).
-  const gridPositions = await listOpenPositions(db, { entryMode: 'grid' });
-  for (const p of gridPositions) held.add(p.symbol);
-  return held;
-}
-
 /** Son X dk içinde kapanan dip_reversal sembolleri (panel/sniper batch). */
 export async function dipReversalCooldownSymbols(
   db: D1Database,
@@ -342,8 +328,7 @@ export async function scanDipReversalCandidates(
   if (!rank || rank.rows.length === 0) return { rows: [], adapt: null };
 
   const { thr, adapt } = resolveScanThresholds(cfg, opts.adaptSnapshot);
-  const [gridSymbols, openSymbols, cooldownSymbols] = await Promise.all([
-    gridHeldSymbols(env.DB),
+  const [openSymbols, cooldownSymbols] = await Promise.all([
     dipReversalOpenSymbols(env.DB),
     dipReversalCooldownSymbols(env.DB, cfg.postExitCooldownMin),
   ]);
@@ -367,7 +352,6 @@ export async function scanDipReversalCandidates(
     let excluded: DipReversalExclusion = null;
     if (isSystemTradeBlockedSymbol(symbol)) excluded = 'system_blocked';
     else if (!row.mid || !bn(row.mid).gt(0)) excluded = 'no_mid';
-    else if (gridSymbols.has(symbol)) excluded = 'grid';
     else if (openSymbols.has(symbol)) excluded = 'open_position';
     else if (cooldownSymbols.has(symbol)) excluded = 'cooldown';
 

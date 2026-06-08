@@ -25,7 +25,6 @@ import type { DipReversalAdaptSnapshot } from './dip-reversal-context';
 import { getDipReversalAdaptContext } from './dip-reversal-context';
 import {
   dipReversalOpenSymbols,
-  gridHeldSymbols,
   scanDipReversalCandidates,
   type DipReversalScanRow,
 } from './dip-reversal-scan';
@@ -235,19 +234,15 @@ export async function manualDipReversalBuy(env: Env, symbolRaw: string): Promise
     return { ok: false, error: 'trading_disabled' };
   }
 
-  const [openCount, openSymbols, gridSymbols] = await Promise.all([
+  const [openCount, openSymbols] = await Promise.all([
     countOpenPositions(env.DB, { entryMode: 'dip_reversal' }),
     dipReversalOpenSymbols(env.DB),
-    gridHeldSymbols(env.DB),
   ]);
   if (openCount >= cfg.maxConcurrent) {
     return { ok: false, error: 'max_concurrent' };
   }
   if (openSymbols.has(symbol)) {
     return { ok: false, error: 'already_open' };
-  }
-  if (gridSymbols.has(symbol)) {
-    return { ok: false, error: 'grid_held' };
   }
 
   const { rows } = await scanDipReversalCandidates(env, cfg, { panelMode: 'live' });

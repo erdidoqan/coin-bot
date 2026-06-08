@@ -29,13 +29,7 @@ export async function runDipReversalReconcile(
   gateway: TradingGateway,
   adaptSnapshot?: DipReversalAdaptSnapshot | null,
 ): Promise<void> {
-  // Dip Reversal pozisyonları + grid'den devredilen (entry_mode='grid') pozisyonlar
-  // aynı tek-pozisyon çıkış mantığıyla yönetilir (trailing + hard/time/adapt stop).
-  const [dipPositions, gridPositions] = await Promise.all([
-    listOpenPositions(env.DB, { entryMode: 'dip_reversal' }),
-    listOpenPositions(env.DB, { entryMode: 'grid' }),
-  ]);
-  const positions = [...dipPositions, ...gridPositions];
+  const positions = await listOpenPositions(env.DB, { entryMode: 'dip_reversal' });
   if (positions.length === 0) return;
 
   const cfg = await getDipReversalConfig(env.DB, env);

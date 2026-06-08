@@ -2,9 +2,6 @@ import { runScout } from './jobs/scout';
 import { runSniper } from './jobs/sniper';
 import { runReconcile } from './jobs/reconcile';
 import { runTickScalpMaintenance } from './jobs/tick-scalp-sniper';
-import { runGridMaintenance, recoverAllActiveGrids, forceRecenterGrid } from './jobs/grid-run';
-import { runGridScout } from './jobs/grid-scout';
-import { runGridSweep } from './jobs/grid-sweep';
 import { runDustConvert } from './jobs/dust-convert';
 import {
   prepareDipReversalAdaptSnapshot,
@@ -24,7 +21,6 @@ import {
   isTickScalpEnabled,
   isStrategyAutoMode,
   getStrategyRouterConfig,
-  getConfig,
 } from './db/bot-config';
 import { countOpenPositions } from './db/open-positions';
 import type { DipReversalAdaptSnapshot } from './jobs/dip-reversal-context';
@@ -34,18 +30,9 @@ export type ManualJob =
   | 'sniper'
   | 'reconcile'
   | 'tick'
-  | 'grid'
-  | 'grid-scout'
-  | 'grid-sweep'
   | 'dust-convert'
-  | 'grid-recover-active'
-  | 'grid-recenter'
   | 'dip-reversal'
   | 'all';
-
-async function isGridEnabled(env: Env): Promise<boolean> {
-  return (await getConfig(env.DB, 'grid_enabled', env)) === 'true';
-}
 
 /**
  * Dip Reversal Sniper — grid ile PARALEL, bağımsız strateji. Sadece dakika cron'unda
@@ -204,20 +191,10 @@ async function runDipReversalTick(
 }
 
 /**
- * Cron yönlendirici. Grid modunda scout (watchlist + DO WS) ÇALIŞMAZ — grid tek
- * sembolle çalışır, watchlist/DO'ya ihtiyacı yok. Her iki cron da grid bakımına gider.
+ * Cron yönlendirici. 15-dk: watchlist taraması (scout). 1-dk: strateji router
+ * (momentum/dip/pause) + dip-reversal cycle.
  */
 export async function runScheduled(env: Env, cron: string): Promise<void> {
-  if (await isGridEnabled(env)) {
-    // 15-dk: aday seç + DO'ya ver (WS izleme). 1-dk: grid bakımı + readiness'li giriş.
-    if (cron === '*/15 * * * *') {
-      await runGridScout(env);
-    } else {
-      await runGridMaintenance(env);
-    }
-    await runDipReversalTick(env, cron);
-    return;
-  }
   if (cron === '*/15 * * * *') {
     await runScout(env);
     return;
@@ -275,12 +252,6 @@ export async function runSniperOrReconcile(
   env: Env,
   opts?: { routed?: StrategyChoice | null },
 ): Promise<void> {
-  // Grid modu aktifse tek yol: grid bakımı (kurulum + fill + trend koruması).
-  if (await isGridEnabled(env)) {
-    await runGridMaintenance(env);
-    return;
-  }
-
   // Auto-mode: tick-scalp havuzda yok. Açık pozisyonları yönet + momentum seçiliyse giriş.
   if (opts?.routed != null) {
     const state = await getBotState(env.DB);
@@ -351,36 +322,12 @@ export async function runManualJob(env: Env, job: ManualJob): Promise<void> {
     case 'tick':
       await runManualTick(env);
       break;
-    case 'grid':
-      await runGridScout(env);
-      await runGridMaintenance(env);
-      break;
-    case 'grid-scout':
-      await runGridScout(env);
-      break;
-    case 'grid-sweep':
-      await runGridSweep(env);
-      break;
     case 'dust-convert':
       await runDustConvert(env);
       break;
     case 'dip-reversal':
       await runDipReversalCycle(env, { singlePass: true });
       break;
-    case 'grid-recover-active':
-      await recoverAllActiveGrids(env);
-      break;
-    case 'grid-recenter': {
-      const { getActiveGrids } = await import('./db/grid');
-      const grids = await getActiveGrids(env.DB);
-      for (const g of grids) {
-        if (g.status === 'ACTIVE') {
-          await forceRecenterGrid(env, { gridId: g.id });
-        }
-      }
-      await runGridMaintenance(env);
-      break;
-    }
     case 'all':
       await runScout(env);
       await runSniperOrReconcile(env);
@@ -394,12 +341,7 @@ export function parseManualJob(value: string | null): ManualJob | null {
     'sniper',
     'reconcile',
     'tick',
-    'grid',
-    'grid-scout',
-    'grid-sweep',
     'dust-convert',
-    'grid-recover-active',
-    'grid-recenter',
     'dip-reversal',
     'all',
   ];

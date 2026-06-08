@@ -22,11 +22,6 @@ import { BinanceClient, BinanceApiError } from '../exchange/binance';
 import { usesBinanceProxy } from '../exchange/binance-fetch';
 import { isTriggerAuthorized, parseManualJob, runManualJob } from '../trigger';
 import { runForceClose } from '../jobs/force-close';
-import { convertRecoveryToUsdt } from '../jobs/recovery-convert';
-import {
-  executeRecoveryLadderStep,
-  getRecoveryLadderState,
-} from '../jobs/recovery-ladder';
 import { enrichWatchlistLive, formatWatchlistForAdmin } from './watchlist-enrich';
 import { fetchMarketDataStatus } from '../exchange/market-data-client';
 import {
@@ -36,14 +31,6 @@ import {
 } from './dip-reversal-status';
 import { manualDipReversalBuy } from '../jobs/dip-reversal-sniper';
 import { buildTickLiveReport } from './tick-live';
-import {
-  buildGridStatus,
-  buildGridDashboard,
-  buildGridCandidates,
-  buildGridCandidatesReport,
-  buildGridStatusesLive,
-  buildOrphanBalances,
-} from './grid-status';
 import { getShadowSummary } from '../db/micro-shadow';
 import { buildBinanceRangePnl } from './binance-pnl';
 import {
@@ -54,92 +41,7 @@ import { fetchRotationStatus } from './rotation-status';
 import { jsonResponse, optionsResponse } from './cors';
 
 const CONFIG_KEYS: BotConfigKey[] = [
-  // Spot Grid — tek aktif strateji. Eski tick/micro/momentum/hybrid ayarları kaldırıldı.
-  'grid_enabled',
   'live_gate',
-  'grid_symbol',
-  'grid_range_mode',
-  'grid_range_lookback_days',
-  'grid_range_pctl',
-  'grid_lower_price',
-  'grid_upper_price',
-  'grid_count',
-  'grid_investment_usdt',
-  'grid_fee_roundtrip_pct',
-  'grid_fee_wall_multiple',
-  'grid_stop_below_pct',
-  'grid_recovery_margin_pct',
-  'grid_stop_above_pct',
-  'grid_range_reset_enabled',
-  'grid_recenter_enabled',
-  'grid_recenter_drift_pct',
-  'grid_readiness_teardown_enabled',
-  'grid_buy_guard_enabled',
-  'grid_buy_cancel_open_on_not_ready',
-  'grid_buy_block_new_on_not_ready',
-  'grid_buy_cancel_anchor_drawdown_pct',
-  'grid_buy_log_assessment',
-  'grid_teardown_on_readiness_blockers',
-  'grid_teardown_readiness_blockers',
-  'grid_recenter_requires_ready',
-  'grid_max_inventory_usdt',
-  'grid_flash_drop_enabled',
-  'grid_flash_drop_warn_pct',
-  'grid_flash_drop_pause_pct',
-  'grid_flash_drop_recovery_pct',
-  'grid_flash_drop_window_min',
-  'grid_flash_drop_max_fills',
-  'grid_flash_drop_fill_window_min',
-  'grid_flash_drop_overfill_mult',
-  'grid_flash_drop_scout_block_panic',
-  'grid_flash_drop_symbol_cooldown_min',
-  'grid_readiness_downside_bars',
-  'grid_readiness_short_return_bars',
-  'grid_readiness_momentum_warn_pct',
-  'grid_readiness_post_exit_relax_enabled',
-  'grid_readiness_post_exit_relax_days',
-  'grid_readiness_post_exit_momentum_warn_pct',
-  'grid_readiness_max_entry_band_pct',
-  'grid_readiness_medium_return_bars',
-  'grid_readiness_medium_return_warn_pct',
-  'grid_readiness_post_exit_cooldown_enabled',
-  'grid_readiness_post_exit_cooldown_min',
-  'grid_readiness_hour_decline_enabled',
-  'grid_readiness_hour_decline_bars',
-  'grid_allow_new_grid_while_recovering',
-  'grid_readiness_max_path_range_ratio',
-  'grid_readiness_max_bar_range_path_ratio',
-  'grid_readiness_max_stability_range_pct',
-  'grid_readiness_stability_bars',
-  'grid_scout_risk_filter_enabled',
-  'grid_scout_max_abs_change_pct',
-  'grid_scout_pool_multiplier',
-  'grid_ladder_mode',
-  'grid_floor_exit_margin_pct',
-  'grid_max_consecutive_buys',
-  'grid_market_downturn_enabled',
-  'grid_market_downturn_breadth_max_pct',
-  'grid_market_downturn_btc_24h_pct',
-  'grid_market_downturn_btc_15m_return_pct',
-  'grid_market_downturn_scout_min_change_pct',
-  'grid_market_downturn_block_panic',
-  'grid_market_downturn_allow_manual',
-  'grid_market_downturn_force_active',
-  'grid_defensive_mode_enabled',
-  'grid_recovery_ladder_auto_enabled',
-  'grid_defensive_recovery_stop_pct',
-  'grid_defensive_exempt_grid_ids',
-  'grid_setup_market_entry',
-  'grid_use_watchlist',
-  'grid_candidate_count',
-  'grid_max_efficiency_ratio',
-  'grid_min_range_width_pct',
-  'grid_max_range_width_pct',
-  'grid_min_atr_pct',
-  'grid_readiness_max_spread_pct',
-  'grid_readiness_lookback',
-  'grid_exclude_symbols',
-  'grid_max_concurrent',
   // --- Dip Reversal Sniper (bağımsız strateji) ---
   'dip_reversal_enabled',
   'dip_reversal_buy_quote_usdt',
@@ -297,82 +199,6 @@ export async function handleAdminApi(request: Request, env: Env): Promise<Respon
             ? 'IP whitelist Worker çıkış IP’si ile uyuşmuyor olabilir'
             : null,
       });
-    }
-
-    if (path === '/grid' && request.method === 'GET') {
-      const report = await buildGridStatus(env);
-      return jsonResponse(request, report);
-    }
-
-    if (path === '/grid-dashboard' && request.method === 'GET') {
-      // Çekirdek (hızlı): adaylar hariç. Adaylar /grid-candidates'ten progressive yüklenir.
-      const report = await buildGridDashboard(env, { includeCandidates: false });
-      return jsonResponse(request, report);
-    }
-
-    if (path === '/grid-live' && request.method === 'GET') {
-      const grids = await buildGridStatusesLive(env);
-      return jsonResponse(request, { grids });
-    }
-
-    if (path === '/grid-candidates' && request.method === 'GET') {
-      const live = new URL(request.url).searchParams.get('live') === '1';
-      const report = await buildGridCandidatesReport(env, {
-        skipMarketDownturn: live,
-      });
-      return jsonResponse(request, report);
-    }
-
-    if (path === '/grid-orphans' && request.method === 'GET') {
-      const orphans = await buildOrphanBalances(env);
-      return jsonResponse(request, orphans);
-    }
-
-    if (path === '/grid-recovery-convert' && request.method === 'POST') {
-      const body = (await request.json()) as { gridId?: number };
-      if (typeof body.gridId !== 'number') {
-        return jsonResponse(request, { error: 'gridId required' }, 400);
-      }
-      const result = await convertRecoveryToUsdt(env, body.gridId);
-      return jsonResponse(request, result, result.ok ? 200 : 400);
-    }
-
-    if (path === '/grid-recovery-ladder') {
-      if (request.method === 'GET') {
-        const gridId = Number(new URL(request.url).searchParams.get('gridId'));
-        if (!Number.isFinite(gridId) || gridId <= 0) {
-          return jsonResponse(request, { error: 'gridId required' }, 400);
-        }
-        const state = await getRecoveryLadderState(env, gridId);
-        if (!state) {
-          return jsonResponse(request, { error: 'not_recovering' }, 404);
-        }
-        return jsonResponse(request, state);
-      }
-      if (request.method === 'POST') {
-        const body = (await request.json()) as { gridId?: number; stepId?: string };
-        if (typeof body.gridId !== 'number' || typeof body.stepId !== 'string' || !body.stepId) {
-          return jsonResponse(request, { error: 'gridId and stepId required' }, 400);
-        }
-        const result = await executeRecoveryLadderStep(env, body.gridId, body.stepId);
-        const status =
-          result.message === 'already_done'
-            ? 409
-            : result.ok
-              ? 200
-              : 400;
-        return jsonResponse(request, result, status);
-      }
-    }
-
-    if (path === '/grid-cancel' && request.method === 'POST') {
-      const body = (await request.json()) as { gridId?: number };
-      if (typeof body.gridId !== 'number') {
-        return jsonResponse(request, { error: 'gridId required' }, 400);
-      }
-      const { cancelGridOperation } = await import('../jobs/grid-run');
-      const result = await cancelGridOperation(env, body.gridId);
-      return jsonResponse(request, result, result.ok ? 200 : 400);
     }
 
     if (path === '/market-data' && request.method === 'GET') {
