@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
     "build:admin": "cd admin && npm install && npm run build && cd .. && node scripts/copy-admin.mjs",
-    "deploy": "npm run build:admin && wrangler deploy",
+    "deploy": "npm run build:admin && wrangler deploy && node scripts/post-deploy-scout.mjs",
     "types": "wrangler types",
     "db:migrate:local": "wrangler d1 migrations apply coin-bot-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply coin-bot-db --remote",
