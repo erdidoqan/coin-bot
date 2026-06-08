@@ -7,7 +7,10 @@ import { refreshWatchlistMomentumRankings } from './momentum-watchlist';
 import { tryScalpEntry } from './scalp-entry';
 import { runPullbackOnlySniper } from './sniper-pullback-only';
 
-export async function runHybridSniper(env: Env): Promise<void> {
+export async function runHybridSniper(
+  env: Env,
+  opts?: { forceMomentum?: boolean },
+): Promise<void> {
   const state = await getBotState(env.DB);
   if (state.status !== 'IDLE') return;
 
@@ -17,7 +20,9 @@ export async function runHybridSniper(env: Env): Promise<void> {
     return;
   }
 
-  const hybrid = await isHybridEnabled(env.DB, env);
+  // forceMomentum (router momentum kararı): hybrid kapalı olsa bile momentum çalıştır,
+  // ASLA pullback fallback'ine düşme (router pullback'i istemiyor).
+  const hybrid = opts?.forceMomentum || (await isHybridEnabled(env.DB, env));
   if (!hybrid) {
     await runPullbackOnlySniper(env);
     return;

@@ -10,6 +10,8 @@ import type { DipReversalAdaptThresholds } from '../strategy/dip-reversal-adapt'
 
 export type DipReversalDowntrendAdaptMode = 'tighten' | 'block';
 
+export type DipReversalBreadthBasis = '24h' | 'momentum';
+
 export interface DipReversalAdaptConfig {
   enabled: boolean;
   downtrendMode: DipReversalDowntrendAdaptMode;
@@ -17,6 +19,18 @@ export interface DipReversalAdaptConfig {
   volatileBlockEnabled: boolean;
   volatileBlockBreadthMax: number;
   thresholds: DipReversalAdaptThresholds;
+  /** #1 Hızlı breadth: kararda kullanılan breadth kaynağı (shadow→live geçiş). */
+  breadthBasis: DipReversalBreadthBasis;
+  /** Momentum breadth için kline interval (1m/5m/15m). */
+  momentumBreadthInterval: string;
+  /** Momentum breadth ATR çarpanı (coin up sayılma eşiği = atrPct * bu). */
+  momentumBreadthAtrMult: number;
+  /** #3 BTC trend momentum override'ı kararda kullan (shadow→live). */
+  btcMomentumEnabled: boolean;
+  /** #2 Akıllı exit: momentum-recovery guard aktif mi. */
+  smartExitEnabled: boolean;
+  /** Exit guard ATR çarpanı (toparlanıyor eşiği = atrPct * bu). */
+  exitMomentumAtrMult: number;
 }
 
 export interface DipReversalConfig {
@@ -97,6 +111,13 @@ export async function getDipReversalConfig(
     adaptDtGrindRecoveryMult,
     adaptVolatileBlockEnabled,
     adaptVolatileBlockBreadthMax,
+    adaptBreadthBasis,
+    adaptMomentumBreadthInterval,
+    adaptMomentumBreadthAtrMult,
+    adaptBtcMomentumEnabled,
+    adaptBtcMomentumAtrMult,
+    adaptSmartExitEnabled,
+    adaptExitMomentumAtrMult,
   ] = await Promise.all([
     getConfig(db, 'dip_reversal_enabled', env),
     getConfig(db, 'dip_reversal_buy_quote_usdt', env),
@@ -129,11 +150,25 @@ export async function getDipReversalConfig(
     getConfig(db, 'dip_reversal_adapt_dtgrind_recovery_mult', env),
     getConfig(db, 'dip_reversal_adapt_volatile_block_enabled', env),
     getConfig(db, 'dip_reversal_adapt_volatile_block_breadth_max', env),
+    getConfig(db, 'dip_reversal_adapt_breadth_basis', env),
+    getConfig(db, 'dip_reversal_adapt_momentum_breadth_interval', env),
+    getConfig(db, 'dip_reversal_adapt_momentum_breadth_atr_mult', env),
+    getConfig(db, 'dip_reversal_adapt_btc_momentum_enabled', env),
+    getConfig(db, 'dip_reversal_adapt_btc_momentum_atr_mult', env),
+    getConfig(db, 'dip_reversal_adapt_smart_exit_enabled', env),
+    getConfig(db, 'dip_reversal_adapt_exit_momentum_atr_mult', env),
   ]);
 
   const downtrendModeRaw = adaptDowntrendMode.trim().toLowerCase();
   const downtrendMode: DipReversalDowntrendAdaptMode =
     downtrendModeRaw === 'block' ? 'block' : 'tighten';
+
+  const breadthBasis: DipReversalBreadthBasis =
+    adaptBreadthBasis.trim().toLowerCase() === 'momentum' ? 'momentum' : '24h';
+  const momentumIntervalRaw = adaptMomentumBreadthInterval.trim();
+  const momentumBreadthInterval = ['1m', '5m', '15m'].includes(momentumIntervalRaw)
+    ? momentumIntervalRaw
+    : '5m';
 
   return {
     enabled: enabled === 'true',
@@ -160,6 +195,12 @@ export async function getDipReversalConfig(
       downtrendMode,
       volatileBlockEnabled: adaptVolatileBlockEnabled !== 'false',
       volatileBlockBreadthMax: num(adaptVolatileBlockBreadthMax, 10, 0),
+      breadthBasis,
+      momentumBreadthInterval,
+      momentumBreadthAtrMult: num(adaptMomentumBreadthAtrMult, 0.5, 0),
+      btcMomentumEnabled: adaptBtcMomentumEnabled === 'true',
+      smartExitEnabled: adaptSmartExitEnabled !== 'false',
+      exitMomentumAtrMult: num(adaptExitMomentumAtrMult, 0.5, 0),
       thresholds: {
         emaMinSepPct: num(adaptEmaMinSep, 0.1, 0),
         calmAtrMax: num(adaptCalmAtrMax, 0.5, 0),
@@ -172,6 +213,7 @@ export async function getDipReversalConfig(
         dtGrindDropMult: num(adaptDtGrindDropMult, 1.4, 0),
         dtGrindReversalMult: num(adaptDtGrindReversalMult, 1.6, 0),
         dtGrindRecoveryMult: num(adaptDtGrindRecoveryMult, 1.6, 0),
+        btcMomentumAtrMult: num(adaptBtcMomentumAtrMult, 1.0, 0),
       },
     },
   };

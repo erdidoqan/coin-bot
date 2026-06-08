@@ -27,6 +27,8 @@ export interface DipReversalAdaptThresholds {
   dtGrindDropMult: number;
   dtGrindReversalMult: number;
   dtGrindRecoveryMult: number;
+  /** BTC trend momentum override: son N×15m momentum >= atrPct * bu → down'ı flat'e çevir. */
+  btcMomentumAtrMult: number;
 }
 
 export interface DipReversalAdaptContext {
@@ -37,6 +39,14 @@ export interface DipReversalAdaptContext {
   atrPct: number | null;
   breadthPct: number;
   riskOff: boolean;
+  /** Shadow: momentum-bazlı breadth (24h yerine). live=momentum ise breadthPct buradan gelir. */
+  momentumBreadthPct: number | null;
+  /** Kararda kullanılan breadth kaynağı. */
+  breadthBasisLive: '24h' | 'momentum';
+  /** Shadow: BTC kısa momentum ile düzeltilmiş trend. live ise trend buradan gelir. */
+  trendShadow: DipReversalTrend;
+  /** BTC son N×15m kümülatif momentum %. */
+  btcMomentumPct: number | null;
 }
 
 export function classifyDipReversalMode(
@@ -75,6 +85,42 @@ export function resolveTrendFromEma(
     trend: ema9 < ema21 ? 'down' : 'up',
     emaSepPct: sepPct,
   };
+}
+
+/**
+ * EMA trend'ini BTC kısa momentumuyla düzeltir (lagging EMA koruması).
+ * Sadece "down"u hedefler: EMA down derken son `lookback`×15m kümülatif momentum
+ * kendi ATR'sinin `atrMult` katından fazlaysa (güçlü yukarı), trend "flat"e çevrilir.
+ * "flat" calm yolunu açar; yeni enum eklemeden minimal müdahale.
+ */
+export function resolveTrendWithMomentum(
+  ema9: number | null,
+  ema21: number | null,
+  emaMinSepPct: number,
+  closes: number[],
+  atrPct: number | null,
+  atrMult: number,
+  lookback = 4,
+): { trend: DipReversalTrend; emaSepPct: number | null; btcMomentumPct: number | null } {
+  const base = resolveTrendFromEma(ema9, ema21, emaMinSepPct);
+  let btcMomentumPct: number | null = null;
+  const n = closes.length;
+  if (n >= lookback + 1) {
+    const ref = closes[n - 1 - lookback]!;
+    const cur = closes[n - 1]!;
+    if (ref > 0) btcMomentumPct = ((cur - ref) / ref) * 100;
+  }
+  if (base.trend !== 'down') {
+    return { trend: base.trend, emaSepPct: base.emaSepPct, btcMomentumPct };
+  }
+  if (
+    btcMomentumPct != null &&
+    atrPct != null &&
+    btcMomentumPct >= atrPct * atrMult
+  ) {
+    return { trend: 'flat', emaSepPct: base.emaSepPct, btcMomentumPct };
+  }
+  return { trend: base.trend, emaSepPct: base.emaSepPct, btcMomentumPct };
 }
 
 function roundThr(n: number, decimals = 4): number {

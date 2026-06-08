@@ -8,7 +8,8 @@ export type EntryMode =
   | 'momentum_scalp'
   | 'micro_scalp'
   | 'tick_scalp'
-  | 'dip_reversal';
+  | 'dip_reversal'
+  | 'grid';
 
 export interface BotState {
   id: number;

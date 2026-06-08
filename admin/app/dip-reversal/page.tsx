@@ -138,8 +138,38 @@ interface DipReport {
   totals: { realizedPnlToday: string; tradesToday: number };
   adapt: AdaptView;
   recent: ActivityView[];
+  strategyRouter?: StrategyRouterStatus;
   scannedAt: string;
 }
+
+interface StrategyRouterStatus {
+  autoModeEnabled: boolean;
+  lastDecision: {
+    strategy: 'momentum' | 'dip_reversal' | 'pause' | null;
+    reason: string | null;
+    decidedAt: string | null;
+    btcTrend15m: string | null;
+    btcM15Pct: number | null;
+    btcM30Pct: number | null;
+    btcM60Pct: number | null;
+    breadthPct: number | null;
+    atrPct: number | null;
+  } | null;
+  thresholds: {
+    momentumBreadthMin: number;
+    dipBreadthMin: number;
+    volatileAtrMin: number;
+    killAtrMult: number;
+    momentumAtrMult: number;
+    recoverAtrMult: number;
+  };
+}
+
+const ROUTER_STRATEGY_TR: Record<string, string> = {
+  momentum: 'Momentum',
+  dip_reversal: 'Dip Reversal',
+  pause: 'Beklemede',
+};
 
 const MODE_TR: Record<string, string> = {
   calm: 'Sakin (gevşet)',
@@ -538,6 +568,84 @@ export default function DipReversalPage() {
                   {' '}
                   · manuel alım{' '}
                   <span className="font-mono text-amber-300/90">{data.adapt.manualBuyQuoteUsdt} USDT</span>
+                </p>
+              </section>
+            )}
+
+            {data.strategyRouter && (
+              <section className="rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2 text-xs text-slate-300">
+                <div className="mb-1 flex flex-wrap items-center gap-2">
+                  <span className="font-semibold text-slate-200">Strateji Router</span>
+                  {data.strategyRouter.autoModeEnabled ? (
+                    <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-emerald-300">
+                      Auto-Mode: AKTİF
+                    </span>
+                  ) : (
+                    <span className="rounded border border-slate-600/40 bg-slate-600/10 px-2 py-0.5 text-slate-400">
+                      Auto-Mode: KAPALI
+                    </span>
+                  )}
+                  {data.strategyRouter.lastDecision?.strategy && (
+                    <span
+                      className={`rounded border px-2 py-0.5 ${
+                        data.strategyRouter.lastDecision.strategy === 'momentum'
+                          ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                          : data.strategyRouter.lastDecision.strategy === 'dip_reversal'
+                            ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300'
+                            : 'border-slate-600/40 bg-slate-600/10 text-slate-400'
+                      }`}
+                    >
+                      {ROUTER_STRATEGY_TR[data.strategyRouter.lastDecision.strategy] ??
+                        data.strategyRouter.lastDecision.strategy}
+                    </span>
+                  )}
+                </div>
+                {data.strategyRouter.lastDecision?.decidedAt && (
+                  <p className="mb-1 text-slate-500">
+                    Son karar: {timeAgo(data.strategyRouter.lastDecision.decidedAt)} önce
+                    {data.strategyRouter.lastDecision.reason
+                      ? ` · sebep: ${data.strategyRouter.lastDecision.reason}`
+                      : ''}
+                  </p>
+                )}
+                {data.strategyRouter.lastDecision && (
+                  <p className="text-slate-400">
+                    BTC 15m trend: {data.strategyRouter.lastDecision.btcTrend15m ?? '—'} · BTC momentum:{' '}
+                    15dk{' '}
+                    <span className="font-mono">
+                      {data.strategyRouter.lastDecision.btcM15Pct != null
+                        ? `${data.strategyRouter.lastDecision.btcM15Pct >= 0 ? '+' : ''}${data.strategyRouter.lastDecision.btcM15Pct.toFixed(2)}%`
+                        : '—'}
+                    </span>{' '}
+                    · 30dk{' '}
+                    <span className="font-mono">
+                      {data.strategyRouter.lastDecision.btcM30Pct != null
+                        ? `${data.strategyRouter.lastDecision.btcM30Pct >= 0 ? '+' : ''}${data.strategyRouter.lastDecision.btcM30Pct.toFixed(2)}%`
+                        : '—'}
+                    </span>{' '}
+                    · 60dk{' '}
+                    <span className="font-mono">
+                      {data.strategyRouter.lastDecision.btcM60Pct != null
+                        ? `${data.strategyRouter.lastDecision.btcM60Pct >= 0 ? '+' : ''}${data.strategyRouter.lastDecision.btcM60Pct.toFixed(2)}%`
+                        : '—'}
+                    </span>
+                    {' · '}Breadth:{' '}
+                    {data.strategyRouter.lastDecision.breadthPct != null
+                      ? `${data.strategyRouter.lastDecision.breadthPct.toFixed(0)}%`
+                      : '—'}{' '}
+                    · ATR:{' '}
+                    {data.strategyRouter.lastDecision.atrPct != null
+                      ? `${data.strategyRouter.lastDecision.atrPct.toFixed(2)}%`
+                      : '—'}
+                  </p>
+                )}
+                <p className="mt-1 text-slate-500">
+                  Eşikler — momentum breadth ≥{data.strategyRouter.thresholds.momentumBreadthMin}% · dip
+                  breadth ≥{data.strategyRouter.thresholds.dipBreadthMin}% · volatil ATR ≥
+                  {data.strategyRouter.thresholds.volatileAtrMin}% · kill ×
+                  {data.strategyRouter.thresholds.killAtrMult} · momentum ×
+                  {data.strategyRouter.thresholds.momentumAtrMult} · toparlanma ×
+                  {data.strategyRouter.thresholds.recoverAtrMult}
                 </p>
               </section>
             )}

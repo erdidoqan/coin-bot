@@ -29,6 +29,7 @@ import {
   type TickAggFlowConfig,
 } from '../indicators/tick-agg-flow';
 import { buildMarketStreams, WsConnectionPool } from './ws-connection-pool';
+import { computeMomentumBreadth } from '../indicators/momentum-breadth';
 import {
   canFireTickSignal,
   shouldScheduleTickEval,
@@ -169,6 +170,9 @@ export class MarketDataDO extends DurableObject<Env> {
   private scoreConfig: MicroScalpConfig = defaultScoreConfig();
   private regimeCache: MarketRegimeResult | null = null;
   private regimeUpdatedAt = 0;
+  private momentumBreadthCache:
+    | { result: ReturnType<typeof computeMomentumBreadth>; at: number; key: string }
+    | null = null;
   private pool: WsConnectionPool | null = null;
   private lastMessageAt: number | null = null;
   private messageCount = 0;
@@ -346,6 +350,43 @@ export class MarketDataDO extends DurableObject<Env> {
       return Response.json({ rows });
     }
 
+    if (url.pathname === '/momentum-breadth') {
+      // Volatilite-normalize momentum breadth: 24h ticker yerine kısa-vade.
+      // Klines DO belleğinde; tek geçişte tüm watchlist, tek response.
+      const interval = (url.searchParams.get('interval') as KlineInterval | null) ?? '5m';
+      const lookback = Math.max(1, Math.min(Number(url.searchParams.get('lookback') ?? '3'), 20));
+      const atrMult = Number(url.searchParams.get('atrMult') ?? '0.5');
+      const limit = Math.min(lookback + 16, 40);
+      const symbolsParam = url.searchParams.get('symbols');
+      const wl = symbolsParam
+        ? symbolsParam.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+        : this.symbols;
+      // 30s cache: değeri stabilize eder (router whipsaw'ı önler) + DO yükünü düşürür.
+      const cacheKey = `${interval}|${lookback}|${atrMult}|${wl.length}`;
+      if (
+        this.momentumBreadthCache &&
+        this.momentumBreadthCache.key === cacheKey &&
+        Date.now() - this.momentumBreadthCache.at < 30_000
+      ) {
+        return Response.json({
+          ...this.momentumBreadthCache.result,
+          interval,
+          lookback,
+          atrMult,
+          basis: 'momentum',
+          cached: true,
+        });
+      }
+      const result = computeMomentumBreadth(
+        wl,
+        (symbol) => this.klines.getForScoring(symbol, interval, limit),
+        atrMult,
+        lookback,
+      );
+      this.momentumBreadthCache = { result, at: Date.now(), key: cacheKey };
+      return Response.json({ ...result, interval, lookback, atrMult, basis: 'momentum' });
+    }
+
     return Response.json({
       service: 'MarketDataDO',
       endpoints: [
@@ -358,6 +399,7 @@ export class MarketDataDO extends DurableObject<Env> {
         'GET /score',
         'GET /tick-ref',
         'GET /tick-rank',
+        'GET /momentum-breadth',
         'GET /status',
       ],
     });

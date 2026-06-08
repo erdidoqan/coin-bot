@@ -484,6 +484,21 @@ export interface RecoveryLadderState {
   doneCount: number;
 }
 
+export interface GridPositionView {
+  id: number;
+  symbol: string;
+  avgCost: string;
+  netBaseQty: string;
+  spentUsdt: string;
+  hardStopPct: string | null;
+  trailingOrderId: string | null;
+  openedAt: string;
+  lastPrice: string | null;
+  pnlPct: string | null;
+  pnlUsdt: string | null;
+  marketValueUsdt: string | null;
+}
+
 export interface GridDashboard {
   enabled: boolean;
   liveGate: boolean;
@@ -491,6 +506,8 @@ export interface GridDashboard {
   marketDownturnForceActive: boolean;
   maxConcurrent: number;
   grids: GridStatusReport[];
+  /** Alımdan sonra trailing'e devredilen açık pozisyonlar (entry_mode='grid'). */
+  positions: GridPositionView[];
   recovering: GridRecoveryRow[];
   candidates: GridCandidateRow[];
   marketGate?: GridMarketGate;
@@ -508,7 +525,7 @@ export interface GridDashboard {
     symbol: string;
     pnl: string;
     at: string;
-    kind: 'cycle' | 'recovery';
+    kind: 'cycle' | 'recovery' | 'trailing';
     source?: string | null;
     maxAdversePct?: string | null;
   }>;

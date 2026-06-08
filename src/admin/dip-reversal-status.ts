@@ -13,7 +13,12 @@ import {
   type DipReversalAdaptSnapshot,
 } from '../jobs/dip-reversal-context';
 import { fetchTickRank } from '../exchange/market-data-client';
-import { getTickScalpConfig } from '../db/bot-config';
+import {
+  getTickScalpConfig,
+  isStrategyAutoMode,
+  getStrategyRouterConfig,
+  type StrategyRouterConfigValues,
+} from '../db/bot-config';
 import {
   dipReversalOpenSymbols,
   scanDipReversalCandidates,
@@ -189,7 +194,61 @@ export interface DipReversalReport {
   totals: DipReversalTotals;
   adapt: DipReversalAdaptView;
   recent: DipReversalActivityView[];
+  strategyRouter: StrategyRouterStatusView;
   scannedAt: string;
+}
+
+export interface StrategyRouterStatusView {
+  autoModeEnabled: boolean;
+  lastDecision: {
+    strategy: 'momentum' | 'dip_reversal' | 'pause' | null;
+    reason: string | null;
+    decidedAt: string | null;
+    btcTrend15m: string | null;
+    btcM15Pct: number | null;
+    btcM30Pct: number | null;
+    btcM60Pct: number | null;
+    breadthPct: number | null;
+    atrPct: number | null;
+  } | null;
+  thresholds: StrategyRouterConfigValues;
+}
+
+export async function buildStrategyRouterStatus(
+  env: Env,
+): Promise<StrategyRouterStatusView> {
+  const [autoModeEnabled, thresholds] = await Promise.all([
+    isStrategyAutoMode(env.DB, env),
+    getStrategyRouterConfig(env.DB, env),
+  ]);
+
+  let lastDecision: StrategyRouterStatusView['lastDecision'] = null;
+  const { results } = await env.DB.prepare(
+    `SELECT payload, created_at FROM trade_log
+     WHERE event_type = 'STRATEGY_ROUTER_DECISION'
+     ORDER BY id DESC LIMIT 1`,
+  ).all<{ payload: string; created_at: string }>();
+  const row = results?.[0];
+  if (row) {
+    try {
+      const d = JSON.parse(row.payload) as Record<string, unknown>;
+      lastDecision = {
+        strategy: (d.strategy as 'momentum' | 'dip_reversal' | 'pause') ?? null,
+        reason: typeof d.reason === 'string' ? d.reason : null,
+        decidedAt: row.created_at,
+        btcTrend15m: typeof d.trend === 'string' ? d.trend : null,
+        btcM15Pct: typeof d.btcM15Pct === 'number' ? d.btcM15Pct : null,
+        btcM30Pct: typeof d.btcM30Pct === 'number' ? d.btcM30Pct : null,
+        btcM60Pct: typeof d.btcM60Pct === 'number' ? d.btcM60Pct : null,
+        breadthPct: typeof d.breadthPct === 'number' ? d.breadthPct : null,
+        atrPct: typeof d.atrPct === 'number' ? d.atrPct : null,
+      };
+    } catch {
+      lastDecision = null;
+    }
+  }
+
+  return { autoModeEnabled, lastDecision, thresholds };
 }
 
 function parseClosedTradeRow(
@@ -393,7 +452,7 @@ async function fetchDipRankAndAdapt(
   const rank = await fetchTickRank(env, tickCfg);
   let adaptSnapshot: DipReversalAdaptSnapshot | null = null;
   if (cfg.adapt.enabled) {
-    adaptSnapshot = await getDipReversalAdaptContext(env, cfg.adapt.thresholds, { rank });
+    adaptSnapshot = await getDipReversalAdaptContext(env, cfg.adapt, { rank });
     setDipAdaptCache(adaptSnapshot);
   }
   return { rank, adaptSnapshot };
@@ -631,6 +690,7 @@ export async function buildDipReversalReport(env: Env): Promise<DipReversalRepor
     totals,
     adapt: adaptView,
     recent,
+    strategyRouter: await buildStrategyRouterStatus(env),
     scannedAt: new Date().toISOString(),
   };
 }

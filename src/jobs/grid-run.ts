@@ -43,7 +43,7 @@ import {
   serializeBinanceError,
 } from '../exchange/order-errors';
 import { TradingGateway, netQtyFromBuy } from '../exchange/gateway';
-import type { OrderResponse } from '../exchange/binance';
+import type { OrderResponse, SymbolInfo } from '../exchange/binance';
 import {
   parseSymbolFilters,
   formatPrice,
@@ -51,6 +51,10 @@ import {
   meetsMinNotional,
   meetsMinQty,
 } from '../exchange/symbol-filters';
+import { getDipReversalConfig } from '../db/dip-reversal';
+import { computeAvgCost } from '../db/bot-state';
+import { listOpenPositions } from '../db/open-positions';
+import { openTrailingPosition } from '../position/open-trailing-position';
 import {
   computeGridLevels,
   gridSpacingPct,
@@ -454,6 +458,10 @@ export async function runGridMaintenance(env: Env): Promise<void> {
       if (!cfg.allowNewGridWhileRecovering) {
         for (const g of recovering) exclude.add(g.symbol);
       }
+      // Açık pozisyonu olan sembole (grid'den trailing'e devredilen dahil) yeni grid
+      // kurma — open_positions UNIQUE(symbol) ihlalini ve çift-yönetimi önler.
+      const openPositions = await listOpenPositions(env.DB);
+      for (const p of openPositions) exclude.add(p.symbol);
       await setupGrids(env, gateway, cfg, slots, exclude, maintenanceDefensiveMode);
     }
   } finally {
@@ -775,7 +783,7 @@ async function placeSetupMarketEntry(
   lastPrice: number,
   filters: ReturnType<typeof parseSymbolFilters>,
   quotePerLevel: number,
-): Promise<boolean> {
+): Promise<{ qty: string; price: string } | null> {
   const realMode = tradingEnabled(env) && cfg.liveGate;
   const quoteStr = bn(quotePerLevel).toFixed(2);
   let fillPrice: number;
@@ -793,7 +801,7 @@ async function placeSetupMarketEntry(
         quoteUsdt: quoteStr,
         ...serializeBinanceError(err),
       });
-      return false;
+      return null;
     }
     const net = netQtyFromBuy(order, symbol);
     qtyStr = formatQuantity(net.net_base_qty, filters.stepSize);
@@ -805,7 +813,7 @@ async function placeSetupMarketEntry(
         qty: qtyStr,
         minQty: filters.minQty,
       });
-      return false;
+      return null;
     }
     fillPrice = avgFillPriceFromBuyOrder(order) ?? lastPrice;
     const notional = bn(qtyStr).times(fillPrice).toFixed(8);
@@ -817,7 +825,7 @@ async function placeSetupMarketEntry(
         notional,
         minNotional: filters.minNotional,
       });
-      return false;
+      return null;
     }
     binanceOrderId = String(order.orderId);
   } else {
@@ -830,7 +838,7 @@ async function placeSetupMarketEntry(
         quoteUsdt: quoteStr,
         lastPrice,
       });
-      return false;
+      return null;
     }
     qtyStr = paperQty;
     fillPrice = lastPrice;
@@ -859,7 +867,7 @@ async function placeSetupMarketEntry(
       message: err instanceof Error ? err.message : String(err),
       binanceOrderId,
     });
-    return false;
+    return null;
   }
 
   await logEvent(env.DB, 'GRID_SETUP_MARKET_BUY', {
@@ -873,35 +881,9 @@ async function placeSetupMarketEntry(
     realMode,
   });
 
-  if (isBreakevenDip(cfg)) {
-    const floorSync = await syncFloorExitSell(env, gateway, cfg, grid, lastPrice, filters);
-    if (floorSync.changed) {
-      await logEvent(env.DB, 'GRID_FLOOR_EXIT_SYNC', {
-        symbol: grid.symbol,
-        gridId: grid.id,
-        action: floorSync.action,
-        price: floorSync.price,
-        qty: floorSync.qty,
-        avgCost: floorSync.avgCost,
-        context: 'setup_market_entry',
-      });
-    }
-  } else {
-    await armSellAfterBuyFill(
-      env,
-      gateway,
-      cfg,
-      grid,
-      levelIndex,
-      qtyStr,
-      priceStr,
-      levels,
-      lastPrice,
-      filters,
-    );
-  }
-
-  return true;
+  // Yeni model: market alım sonrası floor-exit/grid SELL ARM ETME. Dolum bilgisini
+  // döndür; çağıran (deployGrid) doğrudan trailing handoff'a yönlendirir.
+  return { qty: qtyStr, price: priceStr };
 }
 
 /** LIMIT_MAKER alış: fiyat her zaman güncel fiyatın ALTINDA olmalı (yoksa taker -> red). */
@@ -1005,9 +987,9 @@ async function deployGrid(
   });
 
   let placed = 0;
-  let marketEntryDone = false;
+  const marketEntryDone = false;
   if (cfg.setupMarketEntry) {
-    marketEntryDone = await placeSetupMarketEntry(
+    const marketFill = await placeSetupMarketEntry(
       env,
       gateway,
       cfg,
@@ -1018,7 +1000,24 @@ async function deployGrid(
       filters,
       quotePerLevel,
     );
-    if (marketEntryDone) placed++;
+    if (marketFill) {
+      // Market alım anında doldu → grid/floor/recovery lifecycle YOK.
+      // Doğrudan Dip Reversal tarzı trailing + hard-stop yönetimine devret.
+      await handoffGridFillToTrailing(
+        env,
+        gateway,
+        cfg,
+        grid,
+        marketFill.qty,
+        marketFill.price,
+        filters,
+        symInfo,
+        lastPrice,
+      );
+      const wlH = await listWatchlist(env.DB);
+      await ensureMarketDataWatchlist(env, [...new Set([...wlH.map((w) => w.symbol), symbol])]);
+      return;
+    }
   }
 
   if (isBreakevenDip(cfg)) {
@@ -1492,127 +1491,26 @@ async function maintainGrid(
     fills++;
     await markGridOrder(env.DB, order.id, 'FILLED');
 
-    if (order.side === 'BUY') {
-      const snap = maintainBuyGuardByGridId.get(grid.id) ?? buyGuardSnap;
-      if (cfg.buyLogAssessment && snap) {
-        await logEvent(env.DB, 'GRID_BUY_FILL_ASSESSMENT', {
-          symbol: grid.symbol,
-          gridId: grid.id,
-          fillPrice: order.price,
-          qty: order.qty,
-          anchorPrice: gridAnchorPrice(grid, lastPrice),
-          ...buildAssessmentLogPayload(snap),
-        });
-      }
-    }
+    // Yeni model: grid yalnız "giriş yakalayıcı". SELL emri hiç açılmaz; bir SELL
+    // dolması (eski/legacy grid) sadece FILLED işaretlenir, döngü/yeniden-arm yok.
+    if (order.side !== 'BUY') continue;
 
-    const next = nextOrderAfterFill(order.level_index, order.side, levels, Number(grid.investment_usdt));
-
-    if (order.side === 'SELL') {
-      const proceeds = bn(order.qty).times(order.price);
-      const fillStats = await getGridFilledStats(env.DB, grid.id);
-      const cost = isFloorExitOrder(order)
-        ? bn(order.qty).times(
-            fillStats.boughtQty > 0 ? fillStats.boughtCost / fillStats.boughtQty : Number(order.price),
-          )
-        : bn(order.buy_cost ?? '0');
-      const feePct = cfg.feeRoundtripPct / 100;
-      const pnl = proceeds.minus(cost).minus(proceeds.times(feePct)).toFixed(6);
-      await addGridRealized(env.DB, grid.id, pnl);
-      const excursionPrices = resolveGridCycleExcursionPrices(order, order.buy_cost, order.qty);
-      const buyFilledAt = await getPairedGridBuyFilledAt(env.DB, grid.id, order);
-      const holdMinutes =
-        buyFilledAt != null
-          ? minutesSinceSqliteUtc(buyFilledAt, order.updated_at || new Date().toISOString())
-          : null;
-      const cycleAnalytics = buildGridCycleAnalytics({
-        entryPrice: excursionPrices.entry,
-        exitPrice: order.price,
-        troughPrice: excursionPrices.trough,
-        peakPrice: excursionPrices.peak,
-        holdMinutes,
-        floorExit: isFloorExitOrder(order),
-      });
-      await logEvent(env.DB, 'GRID_CYCLE', {
+    const snap = maintainBuyGuardByGridId.get(grid.id) ?? buyGuardSnap;
+    if (cfg.buyLogAssessment && snap) {
+      await logEvent(env.DB, 'GRID_BUY_FILL_ASSESSMENT', {
         symbol: grid.symbol,
         gridId: grid.id,
-        levelIndex: order.level_index,
-        sellPrice: order.price,
+        fillPrice: order.price,
         qty: order.qty,
-        pnl,
-        floorExit: isFloorExitOrder(order),
-        ...cycleAnalytics,
+        anchorPrice: gridAnchorPrice(grid, lastPrice),
+        ...buildAssessmentLogPayload(snap),
       });
-      maintainBuyGuardByGridId.delete(grid.id);
-      if (needsBuyGuardAssessment(cfg)) {
-        const postCycleSnap = await buildBuyGuardAssessment(env, gateway, cfg, grid, lastPrice);
-        if (postCycleSnap) {
-          maintainBuyGuardByGridId.set(grid.id, postCycleSnap);
-          if (!postCycleSnap.readiness.ready) {
-            flashBuyBlockByGrid.set(grid.id, true);
-            await logEvent(env.DB, 'GRID_CYCLE_READINESS_HOLD', {
-              symbol: grid.symbol,
-              gridId: grid.id,
-              blocker: postCycleSnap.readiness.primaryBlocker,
-              score: Number(postCycleSnap.readiness.score.toFixed(2)),
-              gatesPassed: postCycleSnap.readiness.gates.filter((g) => g.pass).length,
-              gatesTotal: postCycleSnap.readiness.gates.length,
-              ...(cfg.buyLogAssessment ? buildAssessmentLogPayload(postCycleSnap) : {}),
-            });
-          }
-        }
-      }
-      if (!isBreakevenDip(cfg) && next && next.side === 'BUY') {
-        const price = makerBuyPrice(next.price, lastPrice, filters.tickSize);
-        const quotePerLevel = Number(grid.investment_usdt) / grid.grid_count;
-        const qty = buyQtyForGridLevel(quotePerLevel, Number(price), filters);
-        if (qty) {
-          await placeGridOrder(env, gateway, cfg, grid.symbol, grid.id, next.levelIndex, 'BUY', price, qty, null);
-        }
-      }
-    } else if (!isBreakevenDip(cfg)) {
-      const buyCost = bn(order.qty).times(order.price).toFixed(8);
-      if (next && next.side === 'SELL') {
-        const price = makerSellPrice(next.price, lastPrice, filters.tickSize);
-        const qty = formatQuantity(order.qty, filters.stepSize);
-        const notional = bn(qty).times(price).toFixed(8);
-        if (meetsMinQty(qty, filters.minQty) && meetsMinNotional(notional, filters.minNotional)) {
-          await placeGridOrder(env, gateway, cfg, grid.symbol, grid.id, next.levelIndex, 'SELL', price, qty, buyCost);
-        } else {
-          await logEvent(env.DB, 'GRID_REARM_SKIP', {
-            symbol: grid.symbol,
-            gridId: grid.id,
-            levelIndex: next.levelIndex,
-            qty,
-            price,
-            notional,
-            minNotional: filters.minNotional,
-          });
-        }
-      }
     }
-  }
 
-  if (isBreakevenDip(cfg)) {
-    const legacyCanceled = await cancelLegacyGridOpenSells(env, gateway, cfg, grid);
-    if (legacyCanceled > 0) {
-      await logEvent(env.DB, 'GRID_LEGACY_SELL_CANCELED', {
-        symbol: grid.symbol,
-        gridId: grid.id,
-        count: legacyCanceled,
-      });
-    }
-    const floorSync = await syncFloorExitSell(env, gateway, cfg, grid, lastPrice, filters);
-    if (floorSync.changed) {
-      await logEvent(env.DB, 'GRID_FLOOR_EXIT_SYNC', {
-        symbol: grid.symbol,
-        gridId: grid.id,
-        action: floorSync.action,
-        price: floorSync.price,
-        qty: floorSync.qty,
-        avgCost: floorSync.avgCost,
-      });
-    }
+    // BUY doldu → grid/SELL/ladder kurma YOK. Dip Reversal modeli: kalan açık grid
+    // emirlerini iptal et, tek pozisyonu native trailing + hard-stop'a devret.
+    await handoffGridFillToTrailing(env, gateway, cfg, grid, order.qty, order.price, filters, symInfo, lastPrice);
+    return;
   }
 
   if (status === 'in' && !inventoryGuardHit && !flashBuyBlockByGrid.get(grid.id)) {
@@ -1704,6 +1602,81 @@ async function maintainGrid(
     realizedPnl: grid.realized_pnl,
     cycles: grid.cycles,
   });
+}
+
+/**
+ * Bir grid BUY emri dolunca grid döngüsünü kapat ve pozisyonu Dip Reversal tarzı
+ * tek-pozisyon yönetimine devret: kalan açık emirleri iptal et → native trailing
+ * (TAKE_PROFIT) koy + open_positions(entry_mode='grid') aç → grid'i STOPPED yap.
+ * Çıkış (trailing-filled / hard-stop / time-stop / adapt) reconcile'da işlenir.
+ */
+async function handoffGridFillToTrailing(
+  env: Env,
+  gateway: TradingGateway,
+  cfg: GridConfig,
+  grid: GridStateRow,
+  fillQty: string,
+  fillPrice: string,
+  filters: ReturnType<typeof parseSymbolFilters>,
+  symInfo: SymbolInfo,
+  lastPrice: number,
+): Promise<void> {
+  // Kalan açık grid emirlerini iptal et (dolan BUY zaten FILLED işaretli).
+  await cancelOpenGridOrders(env, gateway, cfg, grid);
+
+  // Cüzdandaki gerçek satılabilir miktarı al (fee sonrası net bakiyeye kısılmış).
+  const resolved = await resolveSellQtyFromWallet(gateway, grid.symbol, fillQty);
+  if (!resolved) {
+    await logEvent(env.DB, 'GRID_HANDOFF_LOT_TOO_SMALL', {
+      symbol: grid.symbol,
+      gridId: grid.id,
+      qty: fillQty,
+      minQty: filters.minQty,
+    });
+    await stopGrid(env.DB, grid.id, 'handoff_lot_too_small');
+    return;
+  }
+
+  const sellQty = resolved.sellQty;
+  const usdtSpent = bn(fillQty).times(fillPrice).toFixed(8);
+  const avgCost = computeAvgCost(usdtSpent, sellQty);
+
+  const dipCfg = await getDipReversalConfig(env.DB, env);
+  const opened = await openTrailingPosition(env, gateway, {
+    symbol: grid.symbol,
+    symbolFilters: symInfo.filters,
+    tickSize: filters.tickSize,
+    sellQty,
+    netBaseQty: sellQty,
+    grossBaseQty: fillQty,
+    avgCost,
+    usdtSpent,
+    entryMode: 'grid',
+    trailingActivationPct: dipCfg.trailingActivationPct,
+    trailingCallbackPct: dipCfg.trailingCallbackPct,
+    hardStopPct: dipCfg.hardStopPct,
+    events: {
+      rejected: 'GRID_TRAILING_REJECTED',
+      emergencySellFailed: 'GRID_EMERGENCY_SELL_FAILED',
+    },
+  });
+
+  await logEvent(env.DB, 'GRID_HANDOFF_TO_TRAILING', {
+    symbol: grid.symbol,
+    gridId: grid.id,
+    fillPrice,
+    lastPrice,
+    avgCost,
+    sellQty,
+    usdtSpent,
+    trailingPlaced: opened,
+    trailingActivationPct: dipCfg.trailingActivationPct,
+    trailingCallbackPct: dipCfg.trailingCallbackPct,
+    hardStopPct: dipCfg.hardStopPct,
+    entry_mode: 'grid',
+  });
+
+  await stopGrid(env.DB, grid.id, 'handed_off_to_trailing');
 }
 
 /** Açık grid emirlerini iptal et (Binance + DB). */

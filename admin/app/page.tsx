@@ -363,6 +363,7 @@ export default function DashboardPage() {
 
   const live = data?.tradingEnabled === 'true' && data?.liveGate;
   const grids = data?.grids ?? [];
+  const positions = data?.positions ?? [];
   const recovering = data?.recovering ?? [];
   const forceActive =
     marketGate?.forceActive ?? data?.marketDownturnForceActive ?? false;
@@ -434,7 +435,7 @@ export default function DashboardPage() {
 
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-lg font-medium">Aktif Pozisyonlar ({grids.length})</h2>
+                <h2 className="text-lg font-medium">Hazırlanan grid girişleri ({grids.length})</h2>
                 <p className="mt-0.5 text-[11px] text-slate-500">
                   Fiyat / aralık / unrealized ~1 sn (bookTicker); emirler, ladder, flash ~15 sn
                 </p>
@@ -464,6 +465,70 @@ export default function DashboardPage() {
               <section className="rounded border border-amber-800/50 bg-amber-950/30 px-3 py-3 text-sm text-amber-200">
                 Aktif grid yok — sistem uygun (ranging) aday bekliyor. Aşağıdaki adaylardan biri
                 koşulları sağlayınca grid otomatik kurulur (körü körüne girilmez).
+              </section>
+            )}
+
+            {positions.length > 0 && (
+              <section>
+                <h2 className="mb-2 text-lg font-medium">
+                  Trailing pozisyonlar (grid alımı sonrası) ({positions.length})
+                </h2>
+                <p className="mb-3 text-xs text-slate-400">
+                  Grid alım yakaladı; sonrası tek pozisyon olarak Dip Reversal mantığıyla
+                  yönetiliyor: native trailing (TAKE_PROFIT) + hard-stop + time/adapt stop.
+                  Grid/SELL/ladder kurulmaz.
+                </p>
+                <div className="overflow-x-auto rounded-lg border border-slate-800">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-900 text-slate-400">
+                      <tr>
+                        <th className="px-2 py-2">Sembol</th>
+                        <th className="px-2 py-2">Miktar</th>
+                        <th className="px-2 py-2">Ort. maliyet</th>
+                        <th className="px-2 py-2">Güncel</th>
+                        <th className="px-2 py-2">PnL %</th>
+                        <th className="px-2 py-2">PnL USDT</th>
+                        <th className="px-2 py-2">Değer USDT</th>
+                        <th className="px-2 py-2">Hard-stop</th>
+                        <th className="px-2 py-2">Trailing</th>
+                        <th className="px-2 py-2">Açılış</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {positions.map((p) => {
+                        const pnlPct = p.pnlPct != null ? Number(p.pnlPct) : null;
+                        const pnlTone =
+                          pnlPct == null
+                            ? 'text-slate-400'
+                            : pnlPct >= 0
+                              ? 'text-emerald-300'
+                              : 'text-red-300';
+                        return (
+                          <tr key={p.id} className="border-t border-slate-800">
+                            <td className="px-2 py-2 font-medium text-slate-200">{p.symbol}</td>
+                            <td className="px-2 py-2 text-slate-400">{p.netBaseQty}</td>
+                            <td className="px-2 py-2 text-slate-400">{p.avgCost}</td>
+                            <td className="px-2 py-2 text-slate-400">{p.lastPrice ?? '—'}</td>
+                            <td className={`px-2 py-2 ${pnlTone}`}>
+                              {pnlPct != null ? `${pnlPct.toFixed(2)}%` : '—'}
+                            </td>
+                            <td className={`px-2 py-2 ${pnlTone}`}>{p.pnlUsdt ?? '—'}</td>
+                            <td className="px-2 py-2 text-slate-400">{p.marketValueUsdt ?? '—'}</td>
+                            <td className="px-2 py-2 text-slate-400">
+                              {p.hardStopPct != null ? `%${p.hardStopPct}` : '—'}
+                            </td>
+                            <td className="px-2 py-2 text-slate-400">
+                              {p.trailingOrderId ? '✓' : '—'}
+                            </td>
+                            <td className="px-2 py-2 text-slate-500" title={p.openedAt}>
+                              {formatDateTimeIstanbul(p.openedAt)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               </section>
             )}
 
@@ -692,7 +757,7 @@ export default function DashboardPage() {
             {/* Bugün realize (TR 00:00'dan beri, cycle + kurtarma) */}
             <section>
               <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-                <h2 className="text-lg font-medium">Bugün realize (cycle + kurtarma)</h2>
+                <h2 className="text-lg font-medium">Bugün realize (cycle + kurtarma + trailing)</h2>
                 <span className="text-sm text-slate-400">
                   {data.totals.cyclesToday} işlem ·{' '}
                   <span className={pnlTone(data.totals.realizedPnlToday)}>
@@ -732,6 +797,10 @@ export default function DashboardPage() {
                                   kurtarma
                                 </span>
                               )
+                            ) : c.kind === 'trailing' ? (
+                              <span className="rounded bg-sky-900/40 px-1 py-0.5 text-[10px] text-sky-300">
+                                trailing
+                              </span>
                             ) : (
                               <span className="text-slate-500">cycle</span>
                             )}

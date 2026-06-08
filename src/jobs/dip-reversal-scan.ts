@@ -217,7 +217,13 @@ export async function gridHeldSymbols(db: D1Database): Promise<Set<string>> {
   const { results } = await db
     .prepare("SELECT DISTINCT symbol FROM grid_state WHERE status IN ('ACTIVE','RECOVERING')")
     .all<{ symbol: string }>();
-  return new Set((results ?? []).map((r) => r.symbol));
+  const held = new Set((results ?? []).map((r) => r.symbol));
+  // Grid alımdan sonra trailing'e devredilince grid_state STOPPED olur ama pozisyon
+  // entry_mode='grid' olarak açık kalır; bu sembolleri de grid-held say (dip-reversal
+  // sniper aynı sembole girmesin, open_positions UNIQUE(symbol) ihlali olmasın).
+  const gridPositions = await listOpenPositions(db, { entryMode: 'grid' });
+  for (const p of gridPositions) held.add(p.symbol);
+  return held;
 }
 
 /** Son X dk içinde kapanan dip_reversal sembolleri (panel/sniper batch). */

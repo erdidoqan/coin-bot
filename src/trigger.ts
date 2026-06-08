@@ -10,14 +10,24 @@ import {
   prepareDipReversalAdaptSnapshot,
   runDipReversalSniper,
 } from './jobs/dip-reversal-sniper';
+import { adaptEntryBlockReason } from './strategy/dip-reversal-adapt';
 import { getDipReversalConfig } from './db/dip-reversal';
 import { runDipReversalReconcile } from './jobs/dip-reversal-reconcile';
+import { runHybridSniper } from './jobs/hybrid-sniper';
 import { TradingGateway } from './exchange/gateway';
 import { isBinanceRateLimitError } from './exchange/order-errors';
+import { fetchBtcIntradayMomentum } from './exchange/market-data-client';
+import { selectStrategy, type StrategyChoice } from './strategy/strategy-router';
 import { logEvent } from './db/trade-log';
 import { getBotState } from './db/bot-state';
-import { isTickScalpEnabled, getConfig } from './db/bot-config';
+import {
+  isTickScalpEnabled,
+  isStrategyAutoMode,
+  getStrategyRouterConfig,
+  getConfig,
+} from './db/bot-config';
 import { countOpenPositions } from './db/open-positions';
+import type { DipReversalAdaptSnapshot } from './jobs/dip-reversal-context';
 
 export type ManualJob =
   | 'scout'
@@ -53,16 +63,35 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** 15m mum sınırının ilk N saniyesinde miyiz? Binance kline propagation lag koruma penceresi. */
+function isNear15mBoundary(windowSec = 30): boolean {
+  const secInto15m = Math.floor(Date.now() / 1000) % 900;
+  return secInto15m < windowSec;
+}
+
 async function runDipReversalCycle(
   env: Env,
-  opts?: { singlePass?: boolean },
+  opts?: {
+    singlePass?: boolean;
+    /** Auto-mode kararı; 'dip_reversal' değilse yeni dip girişi yapılmaz (reconcile sürer). */
+    routed?: StrategyChoice | null;
+    /** Paylaşılan adapt snapshot (router'da bir kez hesaplandı; tekrar hesaplama). */
+    snapshot?: DipReversalAdaptSnapshot | null;
+  },
 ): Promise<void> {
   const gateway = new TradingGateway(env);
   const cfg = await getDipReversalConfig(env.DB, env);
-  let adaptSnapshot: Awaited<ReturnType<typeof prepareDipReversalAdaptSnapshot>> = null;
+  let adaptSnapshot: Awaited<ReturnType<typeof prepareDipReversalAdaptSnapshot>> =
+    opts?.snapshot ?? null;
   let blockNewEntries = false;
   let errorLogged = false;
   let entryBlockLogged = false;
+
+  // Auto-mode: router dip dışı bir strateji seçtiyse yeni dip girişi yapma.
+  // Reconcile her geçişte çalışmaya devam eder (açık dip pozisyonları yönetilir).
+  if (opts?.routed != null && opts.routed !== 'dip_reversal') {
+    blockNewEntries = true;
+  }
 
   const logEntryBlocked = async (reason: string, phase: string): Promise<void> => {
     if (entryBlockLogged) return;
@@ -82,10 +111,13 @@ async function runDipReversalCycle(
     }
   };
 
-  try {
-    adaptSnapshot = await prepareDipReversalAdaptSnapshot(env, cfg);
-  } catch (err) {
-    await handleDipError(err, 'adapt_context');
+  // Snapshot paylaşılmadıysa hesapla (auto-mode'da router bir kez hesaplayıp paslar).
+  if (opts?.snapshot === undefined) {
+    try {
+      adaptSnapshot = await prepareDipReversalAdaptSnapshot(env, cfg);
+    } catch (err) {
+      await handleDipError(err, 'adapt_context');
+    }
   }
 
   if (cfg.adapt.enabled && adaptSnapshot === null) {
@@ -93,15 +125,23 @@ async function runDipReversalCycle(
     await logEntryBlocked('adapt_context_missing', 'minute_start');
   }
 
+  let boundaryRefreshDone = false;
+  const nearBoundaryOnStart = cfg.adapt.enabled && isNear15mBoundary();
+
   const start = Date.now();
   for (;;) {
+    // Sınır dakikasının 1. geçişinde sniper atlanır: 15m mum yeni kapandı,
+    // Binance kline verisi henüz kesinleşmemiş olabilir (propagation lag ~5-10s).
+    // 8s sleep sonrası snapshot yenilenir, 2. geçişten itibaren normal devam eder.
+    const skipSniperThisPass = nearBoundaryOnStart && !boundaryRefreshDone;
+
     try {
-      await runDipReversalReconcile(env, gateway);
+      await runDipReversalReconcile(env, gateway, adaptSnapshot);
     } catch (err) {
       await handleDipError(err, 'reconcile');
     }
 
-    if (!blockNewEntries) {
+    if (!blockNewEntries && !skipSniperThisPass) {
       try {
         await runDipReversalSniper(env, gateway, adaptSnapshot);
       } catch (err) {
@@ -112,12 +152,55 @@ async function runDipReversalCycle(
     if (opts?.singlePass) break;
     if (Date.now() - start + DIP_TICK_GAP_MS > DIP_TICK_BUDGET_MS) break;
     await sleep(DIP_TICK_GAP_MS);
+
+    // İlk sleep sonrası: sınır penceresindeyse snapshot'ı tazele.
+    // Bu noktada ~8s geçti, Binance 15m kline verisi artık kesinleşmiştir.
+    if (cfg.adapt.enabled && !boundaryRefreshDone && isNear15mBoundary(90)) {
+      boundaryRefreshDone = true;
+      try {
+        const fresh = await prepareDipReversalAdaptSnapshot(env, cfg);
+        if (fresh !== null) {
+          const prevMode = adaptSnapshot?.mode ?? null;
+          adaptSnapshot = fresh;
+          const reason = adaptEntryBlockReason(fresh.mode, {
+            downtrendMode: cfg.adapt.downtrendMode,
+            volatileBlockEnabled: cfg.adapt.volatileBlockEnabled,
+            volatileBlockBreadthMax: cfg.adapt.volatileBlockBreadthMax,
+            breadthPct: fresh.context.breadthPct,
+          });
+          if (reason && !blockNewEntries) {
+            blockNewEntries = true;
+            await logEntryBlocked('adapt_boundary_block', 'boundary_refresh');
+            await logEvent(env.DB, 'DIP_REVERSAL_ADAPT_BOUNDARY_BLOCK', {
+              reason,
+              mode: fresh.mode,
+              prevMode,
+              breadthPct: fresh.context.breadthPct,
+              atrPct: fresh.context.atrPct,
+              trend: fresh.context.trend,
+            });
+          } else if (prevMode !== fresh.mode) {
+            await logEvent(env.DB, 'DIP_REVERSAL_ADAPT_BOUNDARY_REFRESH', {
+              prevMode,
+              mode: fresh.mode,
+              breadthPct: fresh.context.breadthPct,
+            });
+          }
+        }
+      } catch {
+        // non-fatal: stale snapshot ile devam et
+      }
+    }
   }
 }
 
-async function runDipReversalTick(env: Env, cron: string): Promise<void> {
+async function runDipReversalTick(
+  env: Env,
+  cron: string,
+  opts?: { routed?: StrategyChoice | null; snapshot?: DipReversalAdaptSnapshot | null },
+): Promise<void> {
   if (cron === '*/15 * * * *') return;
-  await runDipReversalCycle(env);
+  await runDipReversalCycle(env, opts);
 }
 
 /**
@@ -139,16 +222,84 @@ export async function runScheduled(env: Env, cron: string): Promise<void> {
     await runScout(env);
     return;
   }
-  await runSniperOrReconcile(env);
-  await runDipReversalTick(env, cron);
+
+  // Auto-mode: rejimi bir kez oku, stratejiyi seç, hem sniper hem dip cycle'a paslama.
+  let routed: StrategyChoice | null = null;
+  let sharedSnapshot: DipReversalAdaptSnapshot | null | undefined = undefined;
+  if (await isStrategyAutoMode(env.DB, env)) {
+    const cfg = await getDipReversalConfig(env.DB, env);
+    let snap: DipReversalAdaptSnapshot | null = null;
+    try {
+      snap = await prepareDipReversalAdaptSnapshot(env, cfg);
+    } catch {
+      snap = null;
+    }
+    const routerCfg = await getStrategyRouterConfig(env.DB, env);
+    const mom = await fetchBtcIntradayMomentum(env);
+    const decision = selectStrategy(
+      {
+        btcM15Pct: mom.m15Pct,
+        btcM30Pct: mom.m30Pct,
+        btcM60Pct: mom.m60Pct,
+        atrPct: snap?.context.atrPct ?? null,
+        breadthPct: snap?.context.breadthPct ?? 0,
+      },
+      {
+        momentumBreadthMin: routerCfg.momentumBreadthMin,
+        dipBreadthMin: routerCfg.dipBreadthMin,
+        volatileAtrMin: routerCfg.volatileAtrMin,
+        killAtrMult: routerCfg.killAtrMult,
+        momentumAtrMult: routerCfg.momentumAtrMult,
+        recoverAtrMult: routerCfg.recoverAtrMult,
+      },
+    );
+    routed = decision.strategy;
+    sharedSnapshot = snap;
+    await logEvent(env.DB, 'STRATEGY_ROUTER_DECISION', {
+      strategy: decision.strategy,
+      reason: decision.reason,
+      btcM15Pct: mom.m15Pct,
+      btcM30Pct: mom.m30Pct,
+      btcM60Pct: mom.m60Pct,
+      trend: snap?.context.trend ?? null,
+      breadthPct: snap?.context.breadthPct ?? null,
+      atrPct: snap?.context.atrPct ?? null,
+    });
+  }
+
+  await runSniperOrReconcile(env, { routed });
+  await runDipReversalTick(env, cron, { routed, snapshot: sharedSnapshot });
 }
 
-export async function runSniperOrReconcile(env: Env): Promise<void> {
+export async function runSniperOrReconcile(
+  env: Env,
+  opts?: { routed?: StrategyChoice | null },
+): Promise<void> {
   // Grid modu aktifse tek yol: grid bakımı (kurulum + fill + trend koruması).
   if (await isGridEnabled(env)) {
     await runGridMaintenance(env);
     return;
   }
+
+  // Auto-mode: tick-scalp havuzda yok. Açık pozisyonları yönet + momentum seçiliyse giriş.
+  if (opts?.routed != null) {
+    const state = await getBotState(env.DB);
+    const tickEnabled = await isTickScalpEnabled(env.DB, env);
+    const tickOpenCount = tickEnabled
+      ? await countOpenPositions(env.DB, { entryMode: 'tick_scalp' })
+      : 0;
+    // Açık pozisyon varsa (state aktif veya tick pozisyonu) çıkışları yönet.
+    if (state.status !== 'IDLE' || tickOpenCount > 0) {
+      await runReconcile(env);
+    }
+    // Yeni giriş yalnızca momentum seçildiyse ve bot boştaysa.
+    // forceMomentum: pullback fallback'ine düşmeden gerçek hybrid momentum çalışır.
+    if (opts.routed === 'momentum' && state.status === 'IDLE') {
+      await runHybridSniper(env, { forceMomentum: true });
+    }
+    return;
+  }
+
   const state = await getBotState(env.DB);
   const tickEnabled = await isTickScalpEnabled(env.DB, env);
   const tickOpenCount = tickEnabled

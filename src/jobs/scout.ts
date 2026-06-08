@@ -7,6 +7,7 @@ import {
   isHybridEnabled,
   isMicroScalpEnabled,
   isTickScalpEnabled,
+  isStrategyAutoMode,
   getMicroScalpConfig,
   getTickScalpConfig,
   getScoutTickConfig,
@@ -31,8 +32,9 @@ import {
 export async function runScout(env: Env): Promise<void> {
   try {
     const stableMaxVolatilityPct = await getConfig(env.DB, 'stable_max_volatility_pct', env);
-    const tickEnabled = await isTickScalpEnabled(env.DB, env);
-    const microScalpEnabled = await isMicroScalpEnabled(env.DB, env);
+    const autoMode = await isStrategyAutoMode(env.DB, env);
+    const tickEnabled = !autoMode && (await isTickScalpEnabled(env.DB, env));
+    const microScalpEnabled = !autoMode && (await isMicroScalpEnabled(env.DB, env));
     const microEnabled = microScalpEnabled || tickEnabled;
     const client = new BinanceClient(env);
 
@@ -48,9 +50,20 @@ export async function runScout(env: Env): Promise<void> {
     let filteredCount = 0;
     let skippedSamples: Array<{ symbol: string; reason: string }> = [];
     let watchlistSize = await getWatchlistSize(env.DB, env);
-    let scoutMode: 'micro' | 'tick' | 'hybrid' = 'hybrid';
+    let scoutMode: 'micro' | 'tick' | 'hybrid' | 'router' = 'hybrid';
 
-    if (microScalpEnabled) {
+    if (autoMode) {
+      // Router modu: geniş, −10% toleranslı watchlist (dip düşüşü + momentum birlikte).
+      scoutMode = 'router';
+      const picked = pickTickWatchlist(
+        tradableTickers,
+        { stableMaxVolatilityPct, maxSkippedSamples: 8 },
+        watchlistSize,
+      );
+      filteredCount = picked.filteredCount;
+      skippedSamples = picked.skippedSamples;
+      kept = picked.top;
+    } else if (microScalpEnabled) {
       scoutMode = 'micro';
       const micro = await getMicroScalpConfig(env.DB, env);
       watchlistSize = micro.universeSize;
@@ -197,7 +210,21 @@ export async function runScout(env: Env): Promise<void> {
       })),
     });
 
-    if (microEnabled) {
+    if (autoMode) {
+      // Router modu: DO'yu besle (dip /tick-rank) + momentum ranking (hybrid girişi).
+      const symbols = normalizedKept.map((t) => t.symbol);
+      const tick = await getTickScalpConfig(env.DB, env);
+      await ensureMarketDataWatchlist(env, symbols, buildTickMarketDataSync(tick));
+      try {
+        const gateway = new TradingGateway(env);
+        await refreshWatchlistMomentumRankings(env, gateway, symbols);
+      } catch (momErr) {
+        await logEvent(env.DB, 'MOMENTUM_SCAN_SKIP', {
+          job: 'scout_router',
+          message: momErr instanceof Error ? momErr.message : String(momErr),
+        });
+      }
+    } else if (microEnabled) {
       const symbols = normalizedKept.map((t) => t.symbol);
       if (tickEnabled) {
         const tick = await getTickScalpConfig(env.DB, env);

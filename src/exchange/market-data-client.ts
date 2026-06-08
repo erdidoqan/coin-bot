@@ -222,6 +222,43 @@ export async function fetchBtc15mKlinesForAdapt(env: Env): Promise<Kline[] | nul
   return raw && sufficient(raw) ? raw : null;
 }
 
+export interface BtcIntradayMomentum {
+  m15Pct: number | null;
+  m30Pct: number | null;
+  m60Pct: number | null;
+}
+
+/**
+ * Router için BTC intraday çoklu-pencere momentum (15/30/60dk), BTC 5m kapanışlarından.
+ * Günlük trend (lagging) yerine botun çalıştığı ölçek. DO boşsa REST fallback.
+ * Veri yoksa tüm alanlar null (router belirsiz → pause yönü).
+ */
+export async function fetchBtcIntradayMomentum(env: Env): Promise<BtcIntradayMomentum> {
+  const empty: BtcIntradayMomentum = { m15Pct: null, m30Pct: null, m60Pct: null };
+  let kl = await fetchKlinesFromDo(env, BTC_SYMBOL, '5m', 14);
+  if (!kl || closedCandlesOnly(kl).length < 12) {
+    try {
+      const client = new BinanceClient(env);
+      const rest = await client.getKlines(BTC_SYMBOL, '5m', 14);
+      if (closedCandlesOnly(rest).length >= 12) kl = rest;
+    } catch {
+      /* rate-limit → eldeki ile devam */
+    }
+  }
+  if (!kl) return empty;
+  const closed = closedCandlesOnly(kl);
+  const c = closed.map((k) => Number(k.close)).filter((x) => x > 0);
+  const n = c.length;
+  if (n < 4) return empty;
+  const pct = (bars: number): number | null => {
+    if (n < bars + 1) return null;
+    const ref = c[n - 1 - bars]!;
+    return ref > 0 ? ((c[n - 1]! - ref) / ref) * 100 : null;
+  };
+  // 5m mum: 3 bar=15dk, 6 bar=30dk, 12 bar=60dk
+  return { m15Pct: pct(3), m30Pct: pct(6), m60Pct: pct(12) };
+}
+
 export async function fetchKlinesFromDo(
   env: Env,
   symbol: string,
@@ -252,6 +289,48 @@ export async function fetchTickersFromDo(
   if (!res.ok) return null;
   const body = await res.json<{ tickers: Ticker24hr[] }>();
   return body.tickers;
+}
+
+export interface MomentumBreadthResponse {
+  breadthPct: number;
+  upCount: number;
+  evaluated: number;
+  total: number;
+  interval: string;
+  lookback: number;
+  atrMult: number;
+  basis: 'momentum';
+}
+
+/** Volatilite-normalize momentum breadth (24h ticker yerine kısa-vade). Tek DO çağrısı. */
+export async function fetchMomentumBreadthFromDo(
+  env: Env,
+  opts: { interval: string; lookback: number; atrMult: number; symbols?: string[] },
+): Promise<MomentumBreadthResponse | null> {
+  const stub = marketDataStub(env);
+  if (!stub) return null;
+  const url = new URL('https://do.internal/momentum-breadth');
+  url.searchParams.set('interval', opts.interval);
+  url.searchParams.set('lookback', String(opts.lookback));
+  url.searchParams.set('atrMult', String(opts.atrMult));
+  if (opts.symbols && opts.symbols.length > 0) {
+    url.searchParams.set('symbols', opts.symbols.join(','));
+  }
+  // Aralıklı DO meşguliyetine karşı retry: 2. deneme genelde 30s cache'den döner.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await stub.fetch(url.toString());
+      if (res.ok) {
+        const body = await res.json<MomentumBreadthResponse>();
+        // evaluated 0 = veri yok (geçici); retry ile gerçek değeri yakala.
+        if (body.evaluated > 0 || attempt === 2) return body;
+      }
+    } catch {
+      /* sonraki denemeye */
+    }
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
 }
 
 export async function fetchRegimeFromDo(

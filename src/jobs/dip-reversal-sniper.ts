@@ -8,7 +8,7 @@
  */
 import { getDipReversalConfig, type DipReversalConfig } from '../db/dip-reversal';
 import { computeAvgCost } from '../db/bot-state';
-import { countOpenPositions, createOpenPosition } from '../db/open-positions';
+import { countOpenPositions } from '../db/open-positions';
 import { logEvent } from '../db/trade-log';
 import { TradingGateway, netQtyFromBuy } from '../exchange/gateway';
 import { fetchRegimeFromDo } from '../exchange/market-data-client';
@@ -18,7 +18,7 @@ import {
   meetsMinQty,
   parseSymbolFilters,
 } from '../exchange/symbol-filters';
-import { resolveTieredTrailing } from '../exchange/trailing-stop';
+import { openTrailingPosition } from '../position/open-trailing-position';
 import { adaptEntryBlockReason } from '../strategy/dip-reversal-adapt';
 import { resolveDipBuyQuoteFromConfig } from '../strategy/dip-reversal-quote';
 import type { DipReversalAdaptSnapshot } from './dip-reversal-context';
@@ -83,55 +83,24 @@ async function executeDipReversalEntry(
     return false;
   }
 
-  try {
-    const tiered = resolveTieredTrailing(
-      avgCost,
-      cfg.trailingActivationPct,
-      cfg.trailingCallbackPct,
-      filters.tickSize,
-      symInfo.filters,
-    );
-    const trail = await gateway.placeTrailingStop(symbol, sellQty, tiered);
-    await createOpenPosition(env.DB, {
-      symbol,
-      entry_mode: 'dip_reversal',
-      net_base_qty: net.net_base_qty,
-      total_usdt_spent: usdtSpent,
-      total_base_qty: net.gross_base_qty,
-      avg_cost: avgCost,
-      trailing_order_id: String(trail.orderId),
-      take_profit_price: null,
-      scalp_stop_loss_pct: cfg.hardStopPct,
-    });
-    await logEvent(env.DB, 'TRAILING_PLACED', {
-      symbol,
-      orderId: trail.orderId,
-      sellQty,
-      avg_cost: avgCost,
-      activationStopPrice: tiered.stopPrice,
-      trailingActivationPct: cfg.trailingActivationPct,
-      trailingCallbackPct: cfg.trailingCallbackPct,
-      trailingDeltaBips: tiered.trailingDeltaBips,
-      orderType: 'TAKE_PROFIT',
-      entry_mode: 'dip_reversal',
-    });
-    return true;
-  } catch (trailErr) {
-    await logEvent(env.DB, 'DIP_REVERSAL_TRAILING_REJECTED', {
-      symbol,
-      sellQty,
-      error: trailErr instanceof Error ? trailErr.message : String(trailErr),
-    });
-    try {
-      await emergencyMarketSell(env, gateway, symbol, net.net_base_qty);
-    } catch (sellErr) {
-      await logEvent(env.DB, 'DIP_REVERSAL_EMERGENCY_SELL_FAILED', {
-        symbol,
-        message: sellErr instanceof Error ? sellErr.message : String(sellErr),
-      });
-    }
-    return false;
-  }
+  return openTrailingPosition(env, gateway, {
+    symbol,
+    symbolFilters: symInfo.filters,
+    tickSize: filters.tickSize,
+    sellQty,
+    netBaseQty: net.net_base_qty,
+    grossBaseQty: net.gross_base_qty,
+    avgCost,
+    usdtSpent,
+    entryMode: 'dip_reversal',
+    trailingActivationPct: cfg.trailingActivationPct,
+    trailingCallbackPct: cfg.trailingCallbackPct,
+    hardStopPct: cfg.hardStopPct,
+    events: {
+      rejected: 'DIP_REVERSAL_TRAILING_REJECTED',
+      emergencySellFailed: 'DIP_REVERSAL_EMERGENCY_SELL_FAILED',
+    },
+  });
 }
 
 export async function runDipReversalSniper(
@@ -147,7 +116,7 @@ export async function runDipReversalSniper(
 
   let snapshot = adaptSnapshot;
   if (cfg.adapt.enabled && snapshot === undefined) {
-    snapshot = await getDipReversalAdaptContext(env, cfg.adapt.thresholds);
+    snapshot = await getDipReversalAdaptContext(env, cfg.adapt);
   }
 
   if (cfg.adapt.enabled && !snapshot) {
@@ -232,7 +201,7 @@ export async function prepareDipReversalAdaptSnapshot(
   cfg: DipReversalConfig,
 ): Promise<DipReversalAdaptSnapshot | null> {
   if (!cfg.adapt.enabled) return null;
-  return getDipReversalAdaptContext(env, cfg.adapt.thresholds);
+  return getDipReversalAdaptContext(env, cfg.adapt);
 }
 
 export type ManualDipBuyError =

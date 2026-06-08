@@ -61,6 +61,9 @@ import { BinanceClient } from '../exchange/binance';
 import { avgCostFromTrades } from '../jobs/grid-sweep';
 import { bn } from '../math/decimal';
 import { buildSymbolWalletClaimsMap, computeExcessFree } from './grid-wallet-claims';
+import { listOpenPositions } from '../db/open-positions';
+import { fetchFloatingPnlForOpenPositionsLight } from './floating-pnl';
+import type { DipReversalPositionView } from './dip-reversal-status';
 
 export interface GridLadderLevel {
   levelIndex: number;
@@ -1099,6 +1102,8 @@ export interface GridDashboard {
   marketDownturnForceActive: boolean;
   maxConcurrent: number;
   grids: GridStatusReport[];
+  /** Alımdan sonra trailing'e devredilen açık pozisyonlar (entry_mode='grid'). */
+  positions: DipReversalPositionView[];
   recovering: GridRecoveryRow[];
   candidates: GridCandidateRow[];
   marketGate: GridMarketGate;
@@ -1116,10 +1121,42 @@ export interface GridDashboard {
     symbol: string;
     pnl: string;
     at: string;
-    kind: 'cycle' | 'recovery';
+    kind: 'cycle' | 'recovery' | 'trailing';
     source?: string | null;
   }>;
   recentLogs: Array<{ id: number; event_type: string; created_at: string; payload: unknown }>;
+}
+
+/** Grid'den trailing'e devredilen açık pozisyonlar + canlı floating PnL. */
+async function buildGridPositions(env: Env): Promise<DipReversalPositionView[]> {
+  const positions = await listOpenPositions(env.DB, { entryMode: 'grid' });
+  if (positions.length === 0) return [];
+  const pnlMap = await fetchFloatingPnlForOpenPositionsLight(
+    env,
+    positions.map((p) => ({
+      id: p.id,
+      symbol: p.symbol,
+      net_base_qty: p.net_base_qty,
+      total_usdt_spent: p.total_usdt_spent,
+    })),
+  );
+  return positions.map((p) => {
+    const pnl = pnlMap.get(p.id);
+    return {
+      id: p.id,
+      symbol: p.symbol,
+      avgCost: p.avg_cost,
+      netBaseQty: p.net_base_qty,
+      spentUsdt: p.total_usdt_spent,
+      hardStopPct: p.scalp_stop_loss_pct,
+      trailingOrderId: p.trailing_order_id,
+      openedAt: p.position_opened_at ?? p.updated_at,
+      lastPrice: pnl?.lastPrice ?? null,
+      pnlPct: pnl?.pnlPct ?? null,
+      pnlUsdt: pnl?.pnlUsdt ?? null,
+      marketValueUsdt: pnl?.marketValueUsdt ?? null,
+    };
+  });
 }
 
 async function buildRecoveringRows(env: Env): Promise<GridRecoveryRow[]> {
@@ -1353,7 +1390,7 @@ export async function buildGridDashboard(
   const cfg = await getGridConfig(env.DB, env);
   // Adaylar yavaş (REST kline fallback) -> çekirdek dashboard'u bloklamasın diye
   // varsayılan olarak ayrı endpoint'ten (progressive) çekilir.
-  const [grids, candidateReport, recovering] = await Promise.all([
+  const [grids, candidateReport, recovering, positions] = await Promise.all([
     buildGridStatuses(env),
     includeCandidates
       ? buildGridCandidatesReport(env)
@@ -1378,6 +1415,7 @@ export async function buildGridDashboard(
           };
         })(),
     buildRecoveringRows(env),
+    buildGridPositions(env),
   ]);
   const candidates = candidateReport.candidates;
 
@@ -1389,11 +1427,22 @@ export async function buildGridDashboard(
      FROM grid_state`,
   ).first<{ pnl: number; cyc: number; act: number; rec: number }>();
 
-  // Bugün realize (TR saati 00:00'dan beri): grid cycle + kurtarma dolumları.
+  // Grid→trailing handoff kapanışları grid_state.realized_pnl'e yazılmaz; POSITION_CLOSED'tan
+  // (entry_mode='grid') ayrıca topla ki all-time realize eksik kalmasın.
+  const handoffTotalRow = await env.DB.prepare(
+    `SELECT COALESCE(SUM(CAST(json_extract(payload,'$.pnl') AS REAL)),0) AS pnl,
+            COUNT(*) AS n
+     FROM trade_log
+     WHERE event_type='POSITION_CLOSED' AND json_extract(payload,'$.entry_mode')='grid'`,
+  ).first<{ pnl: number; n: number }>();
+
+  // Bugün realize (TR saati 00:00'dan beri): grid cycle + kurtarma dolumları
+  // + grid→trailing handoff kapanışları (POSITION_CLOSED entry_mode='grid').
   // created_at UTC saklanır; İstanbul (UTC+3) gün başlangıcı = date('now','+3h') @ 00:00 - 3h.
   const { results: cycleLogs } = await env.DB.prepare(
     `SELECT id, event_type, payload, created_at FROM trade_log
-     WHERE event_type IN ('GRID_CYCLE','GRID_RECOVERY_FILLED')
+     WHERE (event_type IN ('GRID_CYCLE','GRID_RECOVERY_FILLED')
+            OR (event_type='POSITION_CLOSED' AND json_extract(payload,'$.entry_mode')='grid'))
        AND created_at >= datetime(date('now','+3 hours'),'-3 hours')
      ORDER BY id DESC`,
   ).all<{ id: number; event_type: string; payload: string; created_at: string }>();
@@ -1407,13 +1456,17 @@ export async function buildGridDashboard(
       /* ignore */
     }
     realizedPnlToday += Number(p.pnl ?? 0) || 0;
+    const kind: 'recovery' | 'cycle' | 'trailing' =
+      l.event_type === 'GRID_RECOVERY_FILLED'
+        ? 'recovery'
+        : l.event_type === 'POSITION_CLOSED'
+          ? 'trailing'
+          : 'cycle';
     return {
       symbol: p.symbol ?? '—',
       pnl: p.pnl ?? '0',
       at: l.created_at,
-      kind: (l.event_type === 'GRID_RECOVERY_FILLED' ? 'recovery' : 'cycle') as
-        | 'recovery'
-        | 'cycle',
+      kind,
       source: p.source ?? null,
       maxAdversePct: p.max_adverse_pct ?? null,
     };
@@ -1432,13 +1485,14 @@ export async function buildGridDashboard(
     marketDownturnForceActive: cfg.marketDownturnForceActive,
     maxConcurrent: cfg.maxConcurrent,
     grids,
+    positions,
     recovering,
     candidates,
     marketGate: candidateReport.marketGate,
     marketPanic: candidateReport.marketPanic,
     totals: {
-      realizedPnlAllTime: Number(totalsRow?.pnl ?? 0).toFixed(4),
-      cyclesAllTime: Number(totalsRow?.cyc ?? 0),
+      realizedPnlAllTime: (Number(totalsRow?.pnl ?? 0) + Number(handoffTotalRow?.pnl ?? 0)).toFixed(4),
+      cyclesAllTime: Number(totalsRow?.cyc ?? 0) + Number(handoffTotalRow?.n ?? 0),
       activeGrids: Number(totalsRow?.act ?? 0),
       recoveringCount: Number(totalsRow?.rec ?? 0),
       realizedPnlToday: realizedPnlToday.toFixed(4),

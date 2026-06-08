@@ -10,6 +10,14 @@ export type BotConfigKey =
   | 'rotation_window_minutes'
   | 'rotation_min_improvement_pct'
   | 'hybrid_enabled'
+  | 'strategy_auto_mode'
+  | 'strategy_router_momentum_breadth_min'
+  | 'strategy_router_dip_breadth_min'
+  | 'strategy_router_volatile_atr_min'
+  | 'strategy_router_daily_trend_lookback_days'
+  | 'strategy_router_kill_atr_mult'
+  | 'strategy_router_momentum_atr_mult'
+  | 'strategy_router_recover_atr_mult'
   | 'scalp_take_profit_gross_pct'
   | 'scalp_fee_roundtrip_pct'
   | 'scalp_max_hold_minutes'
@@ -244,6 +252,13 @@ export type BotConfigKey =
   | 'dip_reversal_adapt_dtgrind_recovery_mult'
   | 'dip_reversal_adapt_volatile_block_enabled'
   | 'dip_reversal_adapt_volatile_block_breadth_max'
+  | 'dip_reversal_adapt_breadth_basis'
+  | 'dip_reversal_adapt_momentum_breadth_interval'
+  | 'dip_reversal_adapt_momentum_breadth_atr_mult'
+  | 'dip_reversal_adapt_btc_momentum_enabled'
+  | 'dip_reversal_adapt_btc_momentum_atr_mult'
+  | 'dip_reversal_adapt_smart_exit_enabled'
+  | 'dip_reversal_adapt_exit_momentum_atr_mult'
 
 const ENV_FALLBACK: Partial<Record<BotConfigKey, keyof Env>> = {
   hard_stop_loss_pct: 'HARD_STOP_LOSS_PCT',
@@ -264,6 +279,14 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   rotation_window_minutes: '15',
   rotation_min_improvement_pct: '0.2',
   hybrid_enabled: 'false',
+  strategy_auto_mode: 'false',
+  strategy_router_momentum_breadth_min: '50',
+  strategy_router_dip_breadth_min: '20',
+  strategy_router_volatile_atr_min: '0.8',
+  strategy_router_daily_trend_lookback_days: '7',
+  strategy_router_kill_atr_mult: '1.0',
+  strategy_router_momentum_atr_mult: '0.4',
+  strategy_router_recover_atr_mult: '0.3',
   tick_scalp_enabled: 'true',
   micro_scalp_enabled: 'false',
   tick_entry_gain_pct: '0.08',
@@ -501,6 +524,13 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   dip_reversal_adapt_dtgrind_recovery_mult: '1.6',
   dip_reversal_adapt_volatile_block_enabled: 'true',
   dip_reversal_adapt_volatile_block_breadth_max: '10',
+  dip_reversal_adapt_breadth_basis: '24h',
+  dip_reversal_adapt_momentum_breadth_interval: '1m',
+  dip_reversal_adapt_momentum_breadth_atr_mult: '0.5',
+  dip_reversal_adapt_btc_momentum_enabled: 'false',
+  dip_reversal_adapt_btc_momentum_atr_mult: '1.0',
+  dip_reversal_adapt_smart_exit_enabled: 'true',
+  dip_reversal_adapt_exit_momentum_atr_mult: '0.5',
 };
 
 export async function getConfig(
@@ -526,6 +556,45 @@ export async function getConfig(
 
 export async function isHybridEnabled(db: D1Database, env: Env): Promise<boolean> {
   return (await getConfig(db, 'hybrid_enabled', env)) === 'true';
+}
+
+export async function isStrategyAutoMode(db: D1Database, env: Env): Promise<boolean> {
+  return (await getConfig(db, 'strategy_auto_mode', env)) === 'true';
+}
+
+export interface StrategyRouterConfigValues {
+  momentumBreadthMin: number;
+  dipBreadthMin: number;
+  volatileAtrMin: number;
+  killAtrMult: number;
+  momentumAtrMult: number;
+  recoverAtrMult: number;
+}
+
+export async function getStrategyRouterConfig(
+  db: D1Database,
+  env: Env,
+): Promise<StrategyRouterConfigValues> {
+  const [mb, db_, atr, kill, mom, rec] = await Promise.all([
+    getConfig(db, 'strategy_router_momentum_breadth_min', env),
+    getConfig(db, 'strategy_router_dip_breadth_min', env),
+    getConfig(db, 'strategy_router_volatile_atr_min', env),
+    getConfig(db, 'strategy_router_kill_atr_mult', env),
+    getConfig(db, 'strategy_router_momentum_atr_mult', env),
+    getConfig(db, 'strategy_router_recover_atr_mult', env),
+  ]);
+  const n = (v: string, fb: number, min = 0) => {
+    const x = Number(v);
+    return Number.isFinite(x) ? Math.max(min, x) : fb;
+  };
+  return {
+    momentumBreadthMin: n(mb, 50),
+    dipBreadthMin: n(db_, 20),
+    volatileAtrMin: n(atr, 0.8),
+    killAtrMult: n(kill, 1.0),
+    momentumAtrMult: n(mom, 0.4),
+    recoverAtrMult: n(rec, 0.3),
+  };
 }
 
 export async function isMicroScalpEnabled(db: D1Database, env: Env): Promise<boolean> {
@@ -999,6 +1068,13 @@ export async function getMicroScalpConfig(
 
 /** Gözcü + sniper tarama boyutu. Mikro: evren 10–100; tick: watchlist_size 10–100; hibrit: 1–25. */
 export async function getWatchlistSize(db: D1Database, env: Env): Promise<number> {
+  // Router modu: geniş watchlist (dip + momentum birlikte beslenir).
+  if (await isStrategyAutoMode(db, env)) {
+    const raw = await getConfig(db, 'watchlist_size', env);
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 1) return 80;
+    return Math.min(100, Math.max(20, Math.floor(n)));
+  }
   if (await isMicroScalpEnabled(db, env)) {
     const micro = await getMicroScalpConfig(db, env);
     return micro.universeSize;
