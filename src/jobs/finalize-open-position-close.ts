@@ -159,6 +159,21 @@ export async function finalizeOpenPositionCloseFromFilledOrder(
   order: Pick<OrderResponse, 'orderId' | 'cummulativeQuoteQty'>,
   options: FinalizeOpenCloseOptions,
 ): Promise<boolean> {
+  // Çift-işleme guard: pozisyonu önce DB'den "sahiplen" (sil). Başka reconcile turu
+  // zaten işlediyse (changes=0) çift POSITION_CLOSED yazma (STRAX duplikasyon bug'ı).
+  const claimed = await removeOpenPosition(env.DB, position.id);
+  if (!claimed) return false;
+  return writePositionCloseRecords(env, position, order, options);
+}
+
+/** Kapanış kayıtlarını yazar (TRADE_OUTCOME + POSITION_CLOSED + trade_features).
+ *  Pozisyon zaten claim edilmiş (open_positions'tan silinmiş) olmalı — burada claim YOK. */
+async function writePositionCloseRecords(
+  env: Env,
+  position: OpenPosition,
+  order: Pick<OrderResponse, 'orderId' | 'cummulativeQuoteQty'>,
+  options: FinalizeOpenCloseOptions,
+): Promise<boolean> {
   const proceeds = order.cummulativeQuoteQty ?? '0';
   const pnl = subtract(proceeds, position.total_usdt_spent);
 
@@ -226,7 +241,7 @@ export async function finalizeOpenPositionCloseFromFilledOrder(
     });
   }
 
-  await removeOpenPosition(env.DB, position.id);
+  // (pozisyon zaten başta claim edilip silindi)
   return true;
 }
 
@@ -236,6 +251,14 @@ export async function finalizeOpenPositionClose(
   position: OpenPosition,
   options: FinalizeOpenCloseOptions,
 ): Promise<boolean> {
+  // Atomik claim — SATIŞTAN ÖNCE pozisyonu sahiplen. Eşzamanlı reconcile turları
+  // (dakika-içi çoklu pass + üst üste binen cron) aynı pozisyona hard-stop uygulayıp
+  // İKİ kez satmaya çalışıyordu → "insufficient balance" + yanıltıcı DETACH +
+  // kayıp PnL (TON race bug'ı, 2026-06-11). Artık kazanan tur satar; diğer tur
+  // claimed=false görüp sessizce atlar.
+  const claimed = await removeOpenPosition(env.DB, position.id);
+  if (!claimed) return false;
+
   const sold = await closePositionBestEffort(
     env,
     gateway,
@@ -243,18 +266,24 @@ export async function finalizeOpenPositionClose(
     position.net_base_qty,
   );
   if (!sold) {
-    const detached = await detachUnsellableResidualIfNeeded(
-      env,
-      gateway,
-      position,
-      options.source,
-    );
-    return detached;
+    // Pozisyon zaten claim ile silindi. Satılamadıysa (dust/min-notional) detach
+    // mantığını çağır (loglar + redundant remove zararsız changes=0).
+    await detachUnsellableResidualIfNeeded(env, gateway, position, options.source);
+    return true;
   }
 
   const order = await gateway.getOrder(position.symbol, sold.orderId);
   if (order.status !== 'FILLED' && String(env.TRADING_ENABLED) === 'true') {
+    // Market satış nadiren anında FILLED değilse: kayıt zaten silindi (claim'li).
+    // Görünür kalsın diye kritik logla — manuel kontrol gerekebilir.
+    await logEvent(env.DB, 'POSITION_CLOSE_PENDING_AFTER_CLAIM', {
+      symbol: position.symbol,
+      position_id: position.id,
+      orderId: order.orderId,
+      status: order.status,
+      source: options.source,
+    });
     return false;
   }
-  return finalizeOpenPositionCloseFromFilledOrder(env, position, order, options);
+  return writePositionCloseRecords(env, position, order, options);
 }

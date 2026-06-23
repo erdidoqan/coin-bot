@@ -15,7 +15,7 @@ import {
 import { fetchTickRank } from '../exchange/market-data-client';
 import {
   getTickScalpConfig,
-  isStrategyAutoMode,
+  isAutoStrategyEnabled,
   getStrategyRouterConfig,
   type StrategyRouterConfigValues,
 } from '../db/bot-config';
@@ -34,6 +34,51 @@ import {
 } from '../strategy/dip-reversal-adapt';
 import { resolveDipBuyQuoteFromConfig } from '../strategy/dip-reversal-quote';
 import { fetchFloatingPnlForOpenPositionsLight } from './floating-pnl';
+import { getBotState } from '../db/bot-state';
+
+/**
+ * dip-reversal pozisyonları open_positions'a DEĞİL bot_state'e yazılıyor (native
+ * trailing mekanizması). Panel open_positions'tan okuduğu için bu pozisyonlar
+ * görünmüyordu — bot_state aktif pozisyonunu da listeye ekle (open_positions'ta yoksa).
+ */
+async function appendBotStatePosition(
+  env: Env,
+  views: DipReversalPositionView[],
+): Promise<DipReversalPositionView[]> {
+  const state = await getBotState(env.DB);
+  if (state.status !== 'TIER_1_BULL' && state.status !== 'MANUAL_INTERVENTION') {
+    return views;
+  }
+  if (!state.active_symbol) return views;
+  if (views.some((v) => v.symbol === state.active_symbol)) return views;
+
+  const pnlMap = await fetchFloatingPnlForOpenPositionsLight(env, [
+    {
+      id: -1,
+      symbol: state.active_symbol,
+      net_base_qty: state.net_base_qty,
+      total_usdt_spent: state.total_usdt_spent,
+    },
+  ]);
+  const p = pnlMap.get(-1);
+  return [
+    {
+      id: -1,
+      symbol: state.active_symbol,
+      avgCost: state.avg_cost,
+      netBaseQty: state.net_base_qty,
+      spentUsdt: state.total_usdt_spent,
+      hardStopPct: state.scalp_stop_loss_pct,
+      trailingOrderId: state.trailing_order_id,
+      openedAt: state.position_opened_at ?? state.updated_at,
+      lastPrice: p?.lastPrice ?? null,
+      pnlPct: p?.pnlPct ?? null,
+      pnlUsdt: p?.pnlUsdt ?? null,
+      marketValueUsdt: p?.marketValueUsdt ?? null,
+    },
+    ...views,
+  ];
+}
 
 export interface DipReversalGateView {
   id: string;
@@ -218,7 +263,7 @@ export async function buildStrategyRouterStatus(
   env: Env,
 ): Promise<StrategyRouterStatusView> {
   const [autoModeEnabled, thresholds] = await Promise.all([
-    isStrategyAutoMode(env.DB, env),
+    isAutoStrategyEnabled(env.DB, env),
     getStrategyRouterConfig(env.DB, env),
   ]);
 
@@ -279,11 +324,11 @@ function parseClosedTradeRow(
 }
 
 async function loadClosedTrades(db: D1Database): Promise<DipReversalClosedTrade[]> {
+  // Auto Strateji: TÜM kapanan işlemler (dip_reversal + momentum/solo micro_scalp).
   const { results } = await db
     .prepare(
       `SELECT payload, created_at FROM trade_log
        WHERE event_type = 'POSITION_CLOSED'
-         AND payload LIKE '%"entry_mode":"dip_reversal"%'
        ORDER BY id DESC LIMIT 200`,
     )
     .all<{ payload: string; created_at: string }>();
@@ -295,13 +340,12 @@ async function loadClosedTrades(db: D1Database): Promise<DipReversalClosedTrade[
   return out;
 }
 
-/** TR saati 00:00'dan beri kapanan dip_reversal pozisyonları. */
+/** TR saati 00:00'dan beri kapanan TÜM Auto Strateji pozisyonları. */
 async function loadClosedTradesToday(db: D1Database): Promise<DipReversalClosedTrade[]> {
   const { results } = await db
     .prepare(
       `SELECT payload, created_at FROM trade_log
        WHERE event_type = 'POSITION_CLOSED'
-         AND payload LIKE '%"entry_mode":"dip_reversal"%'
          AND created_at >= datetime(date('now','+3 hours'),'-3 hours')
        ORDER BY id DESC LIMIT 100`,
     )
@@ -416,6 +460,8 @@ const RECENT_EVENT_TYPES = new Set([
   'TRAILING_PLACED',
   'POSITION_CLOSED',
   'HARD_STOP_TRIGGERED',
+  'MOMENTUM_BEST_PICK',
+  'MIN_NET_TP_SKIP',
 ]);
 
 function parseActivity(
@@ -428,11 +474,17 @@ function parseActivity(
   } catch {
     detail = { raw: raw.payload };
   }
-  // dip_reversal'a ait olmayan genel event'leri ele
+  // Auto Strateji: dip_reversal + momentum/solo (micro_scalp) işlemlerini göster.
   const isDipPrefixed = raw.event_type.startsWith('DIP_REVERSAL');
-  const isDipTagged = detail.entry_mode === 'dip_reversal' || detail.source === 'dip_reversal_hard_stop' ||
-    String(detail.source ?? '').startsWith('dip_reversal');
-  if (!isDipPrefixed && !isDipTagged) return null;
+  const source = String(detail.source ?? '');
+  const isMomentumEvent =
+    raw.event_type === 'MOMENTUM_BEST_PICK' || raw.event_type === 'MIN_NET_TP_SKIP';
+  const isStrategyTagged =
+    detail.entry_mode === 'dip_reversal' ||
+    detail.entry_mode === 'micro_scalp' ||
+    source.startsWith('dip_reversal') ||
+    source.startsWith('scalp');
+  if (!isDipPrefixed && !isStrategyTagged && !isMomentumEvent) return null;
   return {
     eventType: raw.event_type,
     symbol: typeof detail.symbol === 'string' ? detail.symbol : (typeof detail.chosen === 'string' ? detail.chosen : null),
@@ -558,7 +610,7 @@ export async function buildDipReversalPositionsLive(
   const cfg = await getDipReversalConfig(env.DB, env);
   const [openCount, positions] = await Promise.all([
     countOpenPositions(env.DB, { entryMode: 'dip_reversal' }),
-    listOpenPositions(env.DB, { entryMode: 'dip_reversal' }),
+    listOpenPositions(env.DB),
   ]);
 
   const pnlMap = await fetchFloatingPnlForOpenPositionsLight(
@@ -591,7 +643,7 @@ export async function buildDipReversalPositionsLive(
 
   return {
     capacity: { open: openCount, max: cfg.maxConcurrent },
-    positions: positionViews,
+    positions: await appendBotStatePosition(env, positionViews),
     scannedAt: new Date().toISOString(),
   };
 }
@@ -610,7 +662,7 @@ export async function buildDipReversalReport(env: Env): Promise<DipReversalRepor
         rank,
       }),
       countOpenPositions(env.DB, { entryMode: 'dip_reversal' }),
-    listOpenPositions(env.DB, { entryMode: 'dip_reversal' }),
+    listOpenPositions(env.DB),
     listTradeLogs(env.DB, { limit: 60, offset: 0 }),
     loadClosedTrades(env.DB),
     loadClosedTradesToday(env.DB),
@@ -684,7 +736,7 @@ export async function buildDipReversalReport(env: Env): Promise<DipReversalRepor
       regimeFilter: cfg.regimeFilter,
     },
     candidates,
-    positions: positionViews,
+    positions: await appendBotStatePosition(env, positionViews),
     closedTradesToday,
     pnl,
     totals,

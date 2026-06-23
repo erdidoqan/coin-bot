@@ -1,5 +1,10 @@
 const SYSTEM_BLOCKED_SYMBOLS = new Set<string>([
   'BNBUSDT',
+  // BTC bizim LİDER/REFERANSIMIZ — asla alım hedefi değil. DO BTC'yi her zaman stream eder
+  // (market-data-do setSymbols force-include), bu yüzden bloklamak streaming/rejim/BTC-lider
+  // referansını bozmaz; sadece dip/scalp'in BTC'yi satın almasını engeller (7.5s takılan
+  // düşük-vol BTC pozisyonu tüm botu IDLE değil diye kilitlemişti).
+  'BTCUSDT',
   // Non-ASCII (Çince "Binance Life") düşük güvenli meme token; scout havuzuna sızıyor.
   '币安人生USDT',
 ]);

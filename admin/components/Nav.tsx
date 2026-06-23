@@ -6,7 +6,7 @@ import { useEffect, useState } from 'react';
 import { clearSecret } from '@/lib/api';
 
 const links = [
-  { href: '/', label: 'Dip Reversal' },
+  { href: '/', label: 'Auto Strateji' },
   { href: '/binance-pnl/', label: 'Binance PnL' },
   { href: '/market-data/', label: 'Market verisi' },
   { href: '/logs/', label: 'Olaylar' },

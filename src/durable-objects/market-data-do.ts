@@ -30,10 +30,6 @@ import {
 } from '../indicators/tick-agg-flow';
 import { buildMarketStreams, WsConnectionPool } from './ws-connection-pool';
 import { computeMomentumBreadth } from '../indicators/momentum-breadth';
-import {
-  canFireTickSignal,
-  shouldScheduleTickEval,
-} from '../indicators/tick-fire-gate';
 
 export { parseDepthMessage } from './depth-parse';
 
@@ -186,6 +182,27 @@ export class MarketDataDO extends DurableObject<Env> {
   private lastEvalScheduledMs = new Map<string, number>();
   private lastGlobalFireMs = 0;
   private lastSymbolFireMs = new Map<string, number>();
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // Eviction/hibernation recovery: symbols in-memory kaybolunca storage'dan geri yükle
+    // (hafif — blockConcurrencyWhile'da SADECE symbols okunur; WS/backfill ağır I/O alarm/fetch'te).
+    ctx.blockConcurrencyWhile(async () => {
+      const saved = await ctx.storage.get<string[]>('symbols');
+      if (saved && saved.length > 0) this.symbols = saved;
+    });
+  }
+
+  /** WS pool'u kur/güncelle (eviction sonrası pool null olabilir). */
+  private ensureWs(): void {
+    if (this.symbols.length === 0) return;
+    if (!this.pool) {
+      this.pool = new WsConnectionPool({
+        onMessage: (data, stream) => this.onWsMessage(data, stream),
+      });
+    }
+    this.pool.setStreams(buildMarketStreams(this.symbols));
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -406,9 +423,18 @@ export class MarketDataDO extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    if (this.symbols.length > 0) {
+    // Eviction recovery: in-memory boşsa storage'dan yükle (constructor kaçırmışsa garanti).
+    if (this.symbols.length === 0) {
+      const saved = await this.ctx.storage.get<string[]>('symbols');
+      if (saved && saved.length > 0) {
+        this.symbols = saved;
+        this.ensureWs();
+        await this.backfillMissing();
+      }
+    } else {
+      // WS koptu/pool gitti (eviction) veya sessiz → yeniden kur.
       const silent = this.lastMessageAt ? Date.now() - this.lastMessageAt > STALE_MS : true;
-      if (silent) this.pool?.setStreams(buildMarketStreams(this.symbols));
+      if (!this.pool || silent) this.ensureWs();
     }
     await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
   }
@@ -438,12 +464,10 @@ export class MarketDataDO extends DurableObject<Env> {
       }
     }
 
-    if (!this.pool) {
-      this.pool = new WsConnectionPool({
-        onMessage: (data, stream) => this.onWsMessage(data, stream),
-      });
-    }
-    this.pool.setStreams(buildMarketStreams(this.symbols));
+    // Persist first, cache second: symbols'i storage'a yaz (eviction recovery için).
+    await this.ctx.storage.put('symbols', this.symbols);
+
+    this.ensureWs();
 
     await this.backfillMissing();
     await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
@@ -739,56 +763,10 @@ export class MarketDataDO extends DurableObject<Env> {
     }
   }
 
-  private maybeScheduleTickEval(symbol: string): void {
-    if (TICK_SNIPER_SYMBOLS.has(symbol) || !this.symbols.includes(symbol)) return;
-    const now = Date.now();
-    const last = this.lastEvalScheduledMs.get(symbol) ?? 0;
-    if (!shouldScheduleTickEval(now, last)) return;
-    this.lastEvalScheduledMs.set(symbol, now);
-    void this.runTickEvalForSymbol(symbol);
-  }
-
-  private async runTickEvalForSymbol(symbol: string): Promise<void> {
-    const row = this.evaluateTickSymbol(symbol);
-    if (!row.pass || !row.reversalOk || row.stale) return;
-
-    const now = Date.now();
-    const lastSym = this.lastSymbolFireMs.get(symbol) ?? 0;
-    if (
-      !canFireTickSignal({
-        nowMs: now,
-        lastGlobalFireMs: this.lastGlobalFireMs,
-        lastSymbolFireMs: lastSym,
-      })
-    ) {
-      return;
-    }
-
-    const base = this.env.WORKER_PUBLIC_URL?.replace(/\/$/, '');
-    const secret = this.env.TRIGGER_SECRET;
-    if (!base || !secret) return;
-
-    this.lastGlobalFireMs = now;
-    this.lastSymbolFireMs.set(symbol, now);
-
-    const signalId = crypto.randomUUID();
-    try {
-      await fetch(`${base}/internal/tick-fire`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Trigger-Secret': secret,
-        },
-        body: JSON.stringify({
-          symbol,
-          signalId,
-          row,
-          firedAtMs: now,
-        }),
-      });
-    } catch {
-      /* WS sniper fire failed — cooldown already applied */
-    }
+  // Tick-fire kaldırıldı (Auto Strateji: sadece router momentum/dip giriş yapar).
+  // DO artık tick sinyali atmaz; /tick-rank + evaluateTickSymbol dip-reversal için korunur.
+  private maybeScheduleTickEval(_symbol: string): void {
+    /* no-op */
   }
 
   private async on1mClosed(symbol: string): Promise<void> {

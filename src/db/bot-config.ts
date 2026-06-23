@@ -9,8 +9,7 @@ export type BotConfigKey =
   | 'trailing_tight_callback_pct'
   | 'rotation_window_minutes'
   | 'rotation_min_improvement_pct'
-  | 'hybrid_enabled'
-  | 'strategy_auto_mode'
+  | 'auto_strategy_enabled'
   | 'strategy_router_momentum_breadth_min'
   | 'strategy_router_dip_breadth_min'
   | 'strategy_router_volatile_atr_min'
@@ -34,7 +33,6 @@ export type BotConfigKey =
   | 'momentum_switch_min_score_pct'
   | 'momentum_switch_min_minutes'
   | 'momentum_scan_cursor'
-  | 'micro_scalp_enabled'
   | 'micro_universe_size'
   | 'micro_min_quote_volume_usdt'
   | 'micro_max_spread_pct'
@@ -57,7 +55,6 @@ export type BotConfigKey =
   | 'micro_shadow_horizons_min'
   | 'micro_15m_gate_mode'
   | 'micro_15m_penalty'
-  | 'tick_scalp_enabled'
   | 'tick_entry_gain_pct'
   | 'tick_entry_gain_max_pct'
   | 'tick_max_open_positions'
@@ -191,8 +188,7 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   trailing_tight_callback_pct: '0.5',
   rotation_window_minutes: '15',
   rotation_min_improvement_pct: '0.2',
-  hybrid_enabled: 'false',
-  strategy_auto_mode: 'false',
+  auto_strategy_enabled: 'true',
   strategy_router_momentum_breadth_min: '50',
   strategy_router_dip_breadth_min: '20',
   strategy_router_volatile_atr_min: '0.8',
@@ -200,8 +196,6 @@ const DEFAULTS: Record<BotConfigKey, string> = {
   strategy_router_kill_atr_mult: '1.0',
   strategy_router_momentum_atr_mult: '0.4',
   strategy_router_recover_atr_mult: '0.3',
-  tick_scalp_enabled: 'true',
-  micro_scalp_enabled: 'false',
   tick_entry_gain_pct: '0.08',
   tick_entry_gain_max_pct: '0.80',
   tick_max_open_positions: '2',
@@ -380,12 +374,14 @@ export async function getConfig(
   return DEFAULTS[key];
 }
 
-export async function isHybridEnabled(db: D1Database, env: Env): Promise<boolean> {
-  return (await getConfig(db, 'hybrid_enabled', env)) === 'true';
+// Hybrid (momentum) artık router üzerinden forceMomentum ile çağrılır; manuel flag yok.
+export async function isHybridEnabled(_db: D1Database, _env: Env): Promise<boolean> {
+  return false;
 }
 
-export async function isStrategyAutoMode(db: D1Database, env: Env): Promise<boolean> {
-  return (await getConfig(db, 'strategy_auto_mode', env)) === 'true';
+/** Auto Strateji ana anahtarı: açıkken router (momentum/dip/pause) her zaman çalışır. */
+export async function isAutoStrategyEnabled(db: D1Database, env: Env): Promise<boolean> {
+  return (await getConfig(db, 'auto_strategy_enabled', env)) !== 'false';
 }
 
 export interface StrategyRouterConfigValues {
@@ -423,12 +419,14 @@ export async function getStrategyRouterConfig(
   };
 }
 
-export async function isMicroScalpEnabled(db: D1Database, env: Env): Promise<boolean> {
-  return (await getConfig(db, 'micro_scalp_enabled', env)) === 'true';
+// Tick/micro/hybrid manuel stratejileri kaldırıldı (Auto Strateji router yönetir).
+// Geriye uyum için stub'lar — her zaman false (ölü dallar çalışmaz).
+export async function isMicroScalpEnabled(_db: D1Database, _env: Env): Promise<boolean> {
+  return false;
 }
 
-export async function isTickScalpEnabled(db: D1Database, env: Env): Promise<boolean> {
-  return (await getConfig(db, 'tick_scalp_enabled', env)) === 'true';
+export async function isTickScalpEnabled(_db: D1Database, _env: Env): Promise<boolean> {
+  return false;
 }
 
 /** false = yalnızca TICK_ENTRY_SIGNAL; market buy / SCALP_ENTER yok */
@@ -892,27 +890,12 @@ export async function getMicroScalpConfig(
   };
 }
 
-/** Gözcü + sniper tarama boyutu. Mikro: evren 10–100; tick: watchlist_size 10–100; hibrit: 1–25. */
+/** Auto Strateji tarama boyutu: geniş watchlist (dip + momentum birlikte beslenir). */
 export async function getWatchlistSize(db: D1Database, env: Env): Promise<number> {
-  // Router modu: geniş watchlist (dip + momentum birlikte beslenir).
-  if (await isStrategyAutoMode(db, env)) {
-    const raw = await getConfig(db, 'watchlist_size', env);
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n < 1) return 80;
-    return Math.min(100, Math.max(20, Math.floor(n)));
-  }
-  if (await isMicroScalpEnabled(db, env)) {
-    const micro = await getMicroScalpConfig(db, env);
-    return micro.universeSize;
-  }
   const raw = await getConfig(db, 'watchlist_size', env);
   const n = Number(raw);
-  const fallback = (await isTickScalpEnabled(db, env)) ? 30 : WATCHLIST_SIZE_DEFAULT;
-  if (!Number.isFinite(n) || n < 1) return fallback;
-  if (await isTickScalpEnabled(db, env)) {
-    return Math.min(100, Math.max(10, Math.floor(n)));
-  }
-  return Math.min(25, Math.floor(n));
+  if (!Number.isFinite(n) || n < 1) return 80;
+  return Math.min(100, Math.max(20, Math.floor(n)));
 }
 
 export async function getTradingConfig(

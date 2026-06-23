@@ -6,7 +6,6 @@ import {
   isTriggerAuthorized,
 } from './trigger';
 import { handleAdminApi, adminApiPreflight } from './admin/router';
-import { handleTickFire, type TickFirePayload } from './jobs/tick-fire';
 
 export default {
   async scheduled(
@@ -25,22 +24,6 @@ export default {
 
     if (url.pathname.startsWith('/admin/api')) {
       return handleAdminApi(request, env);
-    }
-
-    if (url.pathname === '/internal/tick-fire') {
-      if (request.method !== 'POST') {
-        return Response.json({ error: 'POST only' }, { status: 405 });
-      }
-      if (!isTriggerAuthorized(request, env)) {
-        return new Response('Unauthorized', { status: 401 });
-      }
-      let body: TickFirePayload;
-      try {
-        body = (await request.json()) as TickFirePayload;
-      } catch {
-        return Response.json({ error: 'invalid_json' }, { status: 400 });
-      }
-      return handleTickFire(env, body);
     }
 
     if (url.pathname === '/trigger') {

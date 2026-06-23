@@ -1,7 +1,5 @@
 import { runScout } from './jobs/scout';
-import { runSniper } from './jobs/sniper';
 import { runReconcile } from './jobs/reconcile';
-import { runTickScalpMaintenance } from './jobs/tick-scalp-sniper';
 import { runDustConvert } from './jobs/dust-convert';
 import {
   prepareDipReversalAdaptSnapshot,
@@ -11,25 +9,20 @@ import { adaptEntryBlockReason } from './strategy/dip-reversal-adapt';
 import { getDipReversalConfig } from './db/dip-reversal';
 import { runDipReversalReconcile } from './jobs/dip-reversal-reconcile';
 import { runHybridSniper } from './jobs/hybrid-sniper';
+import { runBtcLeaderSniper } from './jobs/btc-leader-sniper';
 import { TradingGateway } from './exchange/gateway';
 import { isBinanceRateLimitError } from './exchange/order-errors';
 import { fetchBtcIntradayMomentum } from './exchange/market-data-client';
 import { selectStrategy, type StrategyChoice } from './strategy/strategy-router';
 import { logEvent } from './db/trade-log';
 import { getBotState } from './db/bot-state';
-import {
-  isTickScalpEnabled,
-  isStrategyAutoMode,
-  getStrategyRouterConfig,
-} from './db/bot-config';
-import { countOpenPositions } from './db/open-positions';
+import { isAutoStrategyEnabled, getStrategyRouterConfig } from './db/bot-config';
 import type { DipReversalAdaptSnapshot } from './jobs/dip-reversal-context';
 
 export type ManualJob =
   | 'scout'
   | 'sniper'
   | 'reconcile'
-  | 'tick'
   | 'dust-convert'
   | 'dip-reversal'
   | 'all';
@@ -43,6 +36,9 @@ export type ManualJob =
  * dip+bounce anını yakalama olasılığını katlar. Reconcile her geçişte çalışır (çıkışlar
  * da daha hızlı yönetilir).
  */
+/** BTC 30dk momentum bu eşiğin altındaysa (sert düşüş) yeni dip girişi durdurulur —
+ *  hard-stop kümeleri BTC çöküş anlarında oluşuyordu (zarar analizi 2026-06-10). */
+const BTC_SELLOFF_FLOOR = -0.5;
 const DIP_TICK_BUDGET_MS = 50_000;
 const DIP_TICK_GAP_MS = 8_000;
 
@@ -64,6 +60,8 @@ async function runDipReversalCycle(
     routed?: StrategyChoice | null;
     /** Paylaşılan adapt snapshot (router'da bir kez hesaplandı; tekrar hesaplama). */
     snapshot?: DipReversalAdaptSnapshot | null;
+    /** BTC 30dk momentum — sert düşüşte (selloff) yeni giriş durdurulur. */
+    btcM30Pct?: number | null;
   },
 ): Promise<void> {
   const gateway = new TradingGateway(env);
@@ -74,9 +72,11 @@ async function runDipReversalCycle(
   let errorLogged = false;
   let entryBlockLogged = false;
 
-  // Auto-mode: router dip dışı bir strateji seçtiyse yeni dip girişi yapma.
-  // Reconcile her geçişte çalışmaya devam eder (açık dip pozisyonları yönetilir).
-  if (opts?.routed != null && opts.routed !== 'dip_reversal') {
+  // Multi-TF dönüş girişi HER rejimde çalışır (momentum dahil). Risk-off/downtrend
+  // koruması adapt guard'ında. Reconcile her geçişte çalışır.
+  // BTC SERT DÜŞÜŞ guard: zarar analizi gösterdi ki hard-stop'lar BTC çöküş anlarında
+  // KÜME halinde geliyor (tüm dipler birlikte batıyor). BTC m30 < -0.5 ise yeni giriş yok.
+  if (opts?.btcM30Pct != null && opts.btcM30Pct < BTC_SELLOFF_FLOOR) {
     blockNewEntries = true;
   }
 
@@ -85,6 +85,17 @@ async function runDipReversalCycle(
     entryBlockLogged = true;
     await logEvent(env.DB, 'DIP_REVERSAL_ENTRY_BLOCKED', { reason, phase });
   };
+
+  // ROUTER REJİM KAPISI: 'pause' (zayıf breadth / intraday selloff / belirsiz) → yeni
+  // giriş YOK. Zarar analizi (2026-06-11): giriş sinyali her çözünürlükte kazananı
+  // kaybedenden ayırmıyor; tek tutarlı sinyal REJİM. Dip, router 408× 'pause' derken
+  // girmeye devam edip +5 sabah kazancını akşam zayıf tape'te -10'a çevirdi. Dip sadece
+  // 'momentum' (uptrend) ve 'dip_reversal' (dip_recovery) rejimlerinde girer. Reconcile
+  // (açık poz yönetimi) HER zaman sürer — sadece yeni giriş durur.
+  if (opts?.routed === 'pause') {
+    blockNewEntries = true;
+    await logEntryBlocked('router_pause', 'minute_start');
+  }
 
   const handleDipError = async (err: unknown, phase: string): Promise<void> => {
     const message = err instanceof Error ? err.message : String(err);
@@ -184,7 +195,11 @@ async function runDipReversalCycle(
 async function runDipReversalTick(
   env: Env,
   cron: string,
-  opts?: { routed?: StrategyChoice | null; snapshot?: DipReversalAdaptSnapshot | null },
+  opts?: {
+    routed?: StrategyChoice | null;
+    snapshot?: DipReversalAdaptSnapshot | null;
+    btcM30Pct?: number | null;
+  },
 ): Promise<void> {
   if (cron === '*/15 * * * *') return;
   await runDipReversalCycle(env, opts);
@@ -200,112 +215,71 @@ export async function runScheduled(env: Env, cron: string): Promise<void> {
     return;
   }
 
-  // Auto-mode: rejimi bir kez oku, stratejiyi seç, hem sniper hem dip cycle'a paslama.
-  let routed: StrategyChoice | null = null;
-  let sharedSnapshot: DipReversalAdaptSnapshot | null | undefined = undefined;
-  if (await isStrategyAutoMode(env.DB, env)) {
-    const cfg = await getDipReversalConfig(env.DB, env);
-    let snap: DipReversalAdaptSnapshot | null = null;
-    try {
-      snap = await prepareDipReversalAdaptSnapshot(env, cfg);
-    } catch {
-      snap = null;
-    }
-    const routerCfg = await getStrategyRouterConfig(env.DB, env);
-    const mom = await fetchBtcIntradayMomentum(env);
-    const decision = selectStrategy(
-      {
-        btcM15Pct: mom.m15Pct,
-        btcM30Pct: mom.m30Pct,
-        btcM60Pct: mom.m60Pct,
-        atrPct: snap?.context.atrPct ?? null,
-        breadthPct: snap?.context.breadthPct ?? 0,
-      },
-      {
-        momentumBreadthMin: routerCfg.momentumBreadthMin,
-        dipBreadthMin: routerCfg.dipBreadthMin,
-        volatileAtrMin: routerCfg.volatileAtrMin,
-        killAtrMult: routerCfg.killAtrMult,
-        momentumAtrMult: routerCfg.momentumAtrMult,
-        recoverAtrMult: routerCfg.recoverAtrMult,
-      },
-    );
-    routed = decision.strategy;
-    sharedSnapshot = snap;
-    await logEvent(env.DB, 'STRATEGY_ROUTER_DECISION', {
-      strategy: decision.strategy,
-      reason: decision.reason,
+  // Auto Strateji: router HER ZAMAN piyasayı okur, stratejiyi seçer (momentum/dip/pause).
+  // auto_strategy_enabled=false ise bot tamamen durur (acil kapatma).
+  if (!(await isAutoStrategyEnabled(env.DB, env))) return;
+
+  const cfg = await getDipReversalConfig(env.DB, env);
+  let snap: DipReversalAdaptSnapshot | null = null;
+  try {
+    snap = await prepareDipReversalAdaptSnapshot(env, cfg);
+  } catch {
+    snap = null;
+  }
+  const routerCfg = await getStrategyRouterConfig(env.DB, env);
+  const mom = await fetchBtcIntradayMomentum(env);
+  const decision = selectStrategy(
+    {
       btcM15Pct: mom.m15Pct,
       btcM30Pct: mom.m30Pct,
       btcM60Pct: mom.m60Pct,
-      trend: snap?.context.trend ?? null,
-      breadthPct: snap?.context.breadthPct ?? null,
       atrPct: snap?.context.atrPct ?? null,
-    });
-  }
+      breadthPct: snap?.context.breadthPct ?? 0,
+    },
+    {
+      momentumBreadthMin: routerCfg.momentumBreadthMin,
+      dipBreadthMin: routerCfg.dipBreadthMin,
+      volatileAtrMin: routerCfg.volatileAtrMin,
+      killAtrMult: routerCfg.killAtrMult,
+      momentumAtrMult: routerCfg.momentumAtrMult,
+      recoverAtrMult: routerCfg.recoverAtrMult,
+    },
+  );
+  const routed = decision.strategy;
+  await logEvent(env.DB, 'STRATEGY_ROUTER_DECISION', {
+    strategy: decision.strategy,
+    reason: decision.reason,
+    btcM15Pct: mom.m15Pct,
+    btcM30Pct: mom.m30Pct,
+    btcM60Pct: mom.m60Pct,
+    trend: snap?.context.trend ?? null,
+    breadthPct: snap?.context.breadthPct ?? null,
+    atrPct: snap?.context.atrPct ?? null,
+  });
 
-  await runSniperOrReconcile(env, { routed });
-  await runDipReversalTick(env, cron, { routed, snapshot: sharedSnapshot });
+  await runSniperOrReconcile(env, { routed, btcM30Pct: mom.m30Pct });
+  // BTC-Lider order-flow giriş (öncelikli yeni paradigma — küçük poz). BTC RECOVERING
+  // (satış emildi + dönüş) anında en güçlü order-flow coine girer. Girerse dip fallback
+  // atlanır; girmezse mevcut multi-TF dip devreye girer (geçiş dönemi fallback'i).
+  const btcLed = await runBtcLeaderSniper(env);
+  if (!btcLed) {
+    await runDipReversalTick(env, cron, { routed, snapshot: snap, btcM30Pct: mom.m30Pct });
+  }
 }
+
 
 export async function runSniperOrReconcile(
   env: Env,
-  opts?: { routed?: StrategyChoice | null },
+  _opts?: { routed?: StrategyChoice | null; btcM30Pct?: number | null },
 ): Promise<void> {
-  // Auto-mode: tick-scalp havuzda yok. Açık pozisyonları yönet + momentum seçiliyse giriş.
-  if (opts?.routed != null) {
-    const state = await getBotState(env.DB);
-    const tickEnabled = await isTickScalpEnabled(env.DB, env);
-    const tickOpenCount = tickEnabled
-      ? await countOpenPositions(env.DB, { entryMode: 'tick_scalp' })
-      : 0;
-    // Açık pozisyon varsa (state aktif veya tick pozisyonu) çıkışları yönet.
-    if (state.status !== 'IDLE' || tickOpenCount > 0) {
-      await runReconcile(env);
-    }
-    // Yeni giriş yalnızca momentum seçildiyse ve bot boştaysa.
-    // forceMomentum: pullback fallback'ine düşmeden gerçek hybrid momentum çalışır.
-    if (opts.routed === 'momentum' && state.status === 'IDLE') {
-      await runHybridSniper(env, { forceMomentum: true });
-    }
-    return;
-  }
-
   const state = await getBotState(env.DB);
-  const tickEnabled = await isTickScalpEnabled(env.DB, env);
-  const tickOpenCount = tickEnabled
-    ? await countOpenPositions(env.DB, { entryMode: 'tick_scalp' })
-    : 0;
-
-  if (tickEnabled && tickOpenCount > 0) {
+  // Otomatik YENİ giriş yalnızca multi-TF dip (runDipReversalTick) yolundan yapılır.
+  // Momentum/solo otomatik girişi KALDIRILDI — risk-off'ta guard'sız girip zarar
+  // veriyordu (PEPE micro_scalp -0.40, breadth 0'da). Burada sadece açık pozisyon
+  // yönetimi (reconcile) kalır.
+  if (state.status !== 'IDLE') {
     await runReconcile(env);
-    await runTickScalpMaintenance(env);
-    return;
   }
-
-  if (state.status === 'IDLE') {
-    if (tickEnabled) {
-      await runTickScalpMaintenance(env);
-      return;
-    }
-    await runSniper(env);
-    return;
-  }
-  if (
-    state.status === 'TIER_1_BULL' ||
-    state.status === 'MANUAL_INTERVENTION' ||
-    state.status === 'ERROR'
-  ) {
-    await runReconcile(env);
-    if (tickEnabled) {
-      await runTickScalpMaintenance(env);
-    }
-  }
-}
-
-/** Manuel tick koşusu: sadece tick sniper/reconcile akışı. */
-export async function runManualTick(env: Env): Promise<void> {
-  await runSniperOrReconcile(env);
 }
 
 export async function runManualJob(env: Env, job: ManualJob): Promise<void> {
@@ -314,13 +288,10 @@ export async function runManualJob(env: Env, job: ManualJob): Promise<void> {
       await runScout(env);
       break;
     case 'sniper':
-      await runSniper(env);
+      await runHybridSniper(env, { forceMomentum: true });
       break;
     case 'reconcile':
       await runReconcile(env);
-      break;
-    case 'tick':
-      await runManualTick(env);
       break;
     case 'dust-convert':
       await runDustConvert(env);
@@ -340,7 +311,6 @@ export function parseManualJob(value: string | null): ManualJob | null {
     'scout',
     'sniper',
     'reconcile',
-    'tick',
     'dust-convert',
     'dip-reversal',
     'all',

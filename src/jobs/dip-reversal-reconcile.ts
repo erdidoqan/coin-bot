@@ -14,6 +14,7 @@ import type { TradingGateway } from '../exchange/gateway';
 import type { DipReversalAdaptSnapshot } from './dip-reversal-context';
 import { adaptEntryBlockReason } from '../strategy/dip-reversal-adapt';
 import { ensureTrailingCanceled } from '../exchange/ensure-trailing-canceled';
+import { isOrderGoneError } from '../exchange/order-errors';
 import { fetchKlinesFromDo } from '../exchange/market-data-client';
 import { isSymbolMomentumUp } from '../indicators/momentum-breadth';
 import { computeLossPct, fetchSymbolLastPrice } from '../risk/hard-stop';
@@ -76,9 +77,28 @@ export async function runDipReversalReconcile(
       continue;
     }
 
-    // 2) Native trailing FILLED mi?
+    // 2) Native trailing FILLED mi? + PHANTOM temizliği:
+    //    Trailing order Binance'te "gone" (bulunamıyor) ise pozisyon kapanmış/phantom.
+    //    finalizeOpenPositionClose market sell dener (bakiye varsa satar=gerçek),
+    //    yoksa detach eder (open_positions'tan siler) → TON gibi phantom'ları önler.
     if (pos.trailing_order_id) {
-      const order = await gateway.getOrder(symbol, pos.trailing_order_id);
+      let order;
+      try {
+        order = await gateway.getOrder(symbol, pos.trailing_order_id);
+      } catch (err) {
+        if (isOrderGoneError(err)) {
+          await logEvent(env.DB, 'DIP_REVERSAL_PHANTOM_CLEANUP', {
+            symbol,
+            trailing_order_id: pos.trailing_order_id,
+            net_base_qty: pos.net_base_qty,
+          });
+          await finalizeOpenPositionClose(env, gateway, pos, {
+            source: `${pos.entry_mode}_phantom_cleanup`,
+          });
+          continue;
+        }
+        throw err;
+      }
       if (order.status === 'FILLED') {
         await finalizeOpenPositionCloseFromFilledOrder(env, pos, order, {
           source: `${pos.entry_mode}_trailing_filled`,
@@ -87,10 +107,11 @@ export async function runDipReversalReconcile(
       }
     }
 
-    // 3) Adapt erken çıkış: rejim blocking'e geçtiyse VE kârda değilsek hemen çık.
-    //    Normal time_stop'un 40 dk beklemesi yerine piyasa bozulunca erken kapatır.
-    //    2 dk grace period — giriş cycle'ıyla çakışmayı önler.
-    if (adaptSnapshot && cfg.adapt.enabled) {
+    // 3) Adapt erken çıkış KAPATILDI (2026-06-09): canlı (16 işlem -4.92) + backtest
+    //    gösterdi ki rejim-bozulunca erken kesme zarar veriyor — trailing toparlayabilirdi.
+    //    Pozisyonlar trailing + hard-stop + time-stop ile yönetilir. Geri açmak: true yap.
+    const ADAPT_EXIT_ENABLED = false;
+    if (ADAPT_EXIT_ENABLED && adaptSnapshot && cfg.adapt.enabled) {
       const blockReason = adaptEntryBlockReason(adaptSnapshot.mode, {
         downtrendMode: cfg.adapt.downtrendMode,
         volatileBlockEnabled: cfg.adapt.volatileBlockEnabled,

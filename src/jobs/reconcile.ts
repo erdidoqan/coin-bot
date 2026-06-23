@@ -7,9 +7,7 @@ import {
   ensurePositionOpenedAt,
   resolveEntryMode,
 } from '../db/bot-state';
-import { countOpenPositions } from '../db/open-positions';
 import { runScalpReconcile } from './scalp-reconcile';
-import { runTickMultiReconcile } from './tick-multi-reconcile';
 import { logEvent } from '../db/trade-log';
 import { TradingGateway } from '../exchange/gateway';
 import { isOrderGoneError } from '../exchange/order-errors';
@@ -22,12 +20,12 @@ import {
 } from '../exchange/symbol-filters';
 import { emergencyMarketSell, sellFreeBalanceFromAccount } from './emergency-exit';
 import { checkAndExecuteHardStop } from '../risk/hard-stop';
-import { checkAndExecuteWatchlistRotation } from '../risk/watchlist-rotation';
 import { ensureTrailingCanceled } from '../exchange/ensure-trailing-canceled';
 import { cancelAllOpenOrdersForSymbol } from '../exchange/cancel-open-orders';
 import { bn, subtract } from '../math/decimal';
-import { isHybridEnabled, isMicroScalpEnabled, isTickScalpEnabled } from '../db/bot-config';
+import { isHybridEnabled, isMicroScalpEnabled } from '../db/bot-config';
 import { isScalpEntryMode } from '../db/bot-state';
+import { listOpenPositions } from '../db/open-positions';
 import { listWatchlist } from '../db/watchlist';
 import { refreshWatchlistMomentumRankings } from './momentum-watchlist';
 
@@ -35,25 +33,6 @@ const TERMINAL_FAIL = new Set(['CANCELED', 'EXPIRED', 'REJECTED']);
 
 export async function runReconcile(env: Env): Promise<void> {
   let state = await getBotState(env.DB);
-  const tickEnabled = await isTickScalpEnabled(env.DB, env);
-  if (tickEnabled) {
-    const tickOpenCount = await countOpenPositions(env.DB, { entryMode: 'tick_scalp' });
-    if (tickOpenCount > 0) {
-      const gateway = new TradingGateway(env);
-      try {
-        await runTickMultiReconcile(env, gateway);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        await logEvent(env.DB, 'CRON_ERROR', {
-          job: 'tick-multi-reconcile',
-          message,
-        });
-        console.error('tick-multi-reconcile error', err);
-        throw err;
-      }
-      return;
-    }
-  }
 
   if (state.status === 'ERROR') {
     if (state.active_symbol && bn(state.net_base_qty).gt(0)) {
@@ -98,6 +77,13 @@ export async function runReconcile(env: Env): Promise<void> {
         return;
       }
       if (state.trailing_order_id) {
+        // bot_state, bir open_positions satırının MIRROR'ı olabilir
+        // (syncPrimaryBotStateFromOpenPositions). O pozisyonu dip-reversal-reconcile
+        // (claim-first) yönetir; burada reconcileTrailing İKİNCİ kez kapatıp source'suz
+        // çift POSITION_CLOSED yazıyordu (ADA/STRAX çiftleme bug'ı, 2026-06-11).
+        // Sadece gerçek bot_state-only pozisyonları (open_positions'ta YOK) yönet.
+        const open = await listOpenPositions(env.DB);
+        if (open.some((p) => p.symbol === symbol)) return;
         await reconcileTrailing(env, gateway, symbol, state);
         return;
       }
@@ -136,10 +122,9 @@ async function reconcileTrailing(
   const hardStopFired = await checkAndExecuteHardStop(env, gateway, freshState);
   if (hardStopFired) return;
 
-  if (!isScalpEntryMode(resolveEntryMode(freshState))) {
-    const rotationFired = await checkAndExecuteWatchlistRotation(env, gateway, freshState);
-    if (rotationFired) return;
-  }
+  // Watchlist rotation KAPATILDI (2026-06-09): SMA bazlı rotation multi-TF trailing'ini
+  // eziyordu (kazancı erken kesip aşırı dönüş yaratıyordu — SOL/XRP örnekleri, avgwin<avgloss).
+  // Pozisyonlar artık sadece trailing+hard-stop ile yönetilir.
 
   let order;
   try {

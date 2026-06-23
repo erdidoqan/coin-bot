@@ -180,6 +180,14 @@ const MODE_TR: Record<string, string> = {
 };
 
 const BLOCKER_TR: Record<string, string> = {
+  // Multi-TF dönüş kapıları
+  min_drop: 'Yeterince düşmemiş',
+  prior_dip: 'Zamanlama yanlış (erken/geç)',
+  tf_1m: '1dk negatif',
+  tf_3m: '3dk negatif',
+  tf_10m: '10dk negatif',
+  not_extended: '30dk uzamış (tepe)',
+  // eski (geriye dönük)
   capitulation: 'Düşüş yetersiz',
   ws_decline: 'WS düşüş yok',
   recovery: 'Toparlanma yok',
@@ -190,7 +198,8 @@ const BLOCKER_TR: Record<string, string> = {
   no_mid: 'Fiyat yok',
   grid: 'Grid sembolü',
   open_position: 'Açık pozisyon',
-  cooldown: 'Cooldown',
+  cooldown: 'Cooldown (3sa)',
+  daily_limit: 'Günlük limit (2)',
 };
 
 const ACTIVITY_TR: Record<string, string> = {
@@ -322,6 +331,32 @@ export default function DipReversalPage() {
     }
   }, []);
 
+  const [autoToggling, setAutoToggling] = useState(false);
+  const toggleAutoStrategy = useCallback(async () => {
+    if (!data?.strategyRouter || autoToggling) return;
+    const next = !data.strategyRouter.autoModeEnabled;
+    if (
+      !next &&
+      !window.confirm(
+        'Auto Strateji KAPATILSIN mı? Tüm yeni girişler durur (açık pozisyon yönetimi sürer).',
+      )
+    ) {
+      return;
+    }
+    setAutoToggling(true);
+    try {
+      await apiFetch('/admin/api/actions/auto-strategy', {
+        method: 'POST',
+        body: JSON.stringify({ enabled: next }),
+      });
+      await loadCore();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'toggle hatası');
+    } finally {
+      setAutoToggling(false);
+    }
+  }, [data?.strategyRouter, autoToggling, loadCore]);
+
   useEffect(() => {
     loadCore().catch(() => {});
     const coreIv = setInterval(() => {
@@ -451,7 +486,7 @@ export default function DipReversalPage() {
       <Nav />
       <main className="mx-auto max-w-6xl px-3 py-4 sm:px-4 sm:py-6">
         <div className="mb-4 flex flex-wrap items-center gap-3">
-          <h1 className="text-lg font-semibold text-white">Dip Reversal Sniper</h1>
+          <h1 className="text-lg font-semibold text-white">Auto Strateji</h1>
           {data && (
             <span className="text-xs text-slate-500">
               · adaylar {timeAgo(candidateScannedAt ?? data.scannedAt)} önce
@@ -553,9 +588,9 @@ export default function DipReversalPage() {
                   {data.adapt.riskOff ? ' (risk-off)' : ''}
                 </p>
                 <p className="mt-1 text-slate-500">
-                  Etkin eşikler — düşüş ≥{data.adapt.effectiveMinCapitulationDropPct ?? '—'}% · reversal ≥
-                  {data.adapt.effectiveMinReversalScore ?? '—'} · toparlanma ≥
-                  {data.adapt.effectiveMinRecoveryFromLowPct ?? '—'}%
+                  Multi-TF eşikleri — düşüş ≥0.4% · toparlanma{' '}
+                  {data.adapt.effectiveMinRecoveryFromLowPct ?? '0.15'}–0.40% (tam dönüş anı) · 1/3/10dk
+                  pozitif · 30dk −0.5…+1.5%
                   {data.adapt.enabled && data.adapt.effectiveBuyQuoteUsdt != null && (
                     <>
                       {' '}
@@ -576,15 +611,23 @@ export default function DipReversalPage() {
               <section className="rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2 text-xs text-slate-300">
                 <div className="mb-1 flex flex-wrap items-center gap-2">
                   <span className="font-semibold text-slate-200">Strateji Router</span>
-                  {data.strategyRouter.autoModeEnabled ? (
-                    <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-emerald-300">
-                      Auto-Mode: AKTİF
-                    </span>
-                  ) : (
-                    <span className="rounded border border-slate-600/40 bg-slate-600/10 px-2 py-0.5 text-slate-400">
-                      Auto-Mode: KAPALI
-                    </span>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => void toggleAutoStrategy()}
+                    disabled={autoToggling}
+                    title="Tıkla: Auto Strateji'yi aç/kapat"
+                    className={`rounded border px-2 py-0.5 transition disabled:opacity-50 ${
+                      data.strategyRouter.autoModeEnabled
+                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
+                        : 'border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20'
+                    }`}
+                  >
+                    {autoToggling
+                      ? '…'
+                      : data.strategyRouter.autoModeEnabled
+                        ? '🟢 Auto-Mode: AKTİF (kapat)'
+                        : '🔴 Auto-Mode: KAPALI (aç)'}
+                  </button>
                   {data.strategyRouter.lastDecision?.strategy && (
                     <span
                       className={`rounded border px-2 py-0.5 ${
@@ -651,20 +694,24 @@ export default function DipReversalPage() {
             )}
 
             <p className="text-xs leading-relaxed text-slate-400">
-              Yüksek dalgalı düşüşte capitulation dip + bounce onayı → tek market alım, Binance native
-              trailing ile çıkış, hard-stop koruması. Grid&apos;e sıfır temas. Eşikler:
-              capitulation ≥%{data.config.minCapitulationDropPct} ({data.config.flashWindowMin}dk),
-              WS düşüş ≥%{data.config.minWsDeclinePct}, toparlanma ≥%
-              {data.config.minRecoveryFromLowPct}, reversal ≥{data.config.minReversalScore}, dip ≤
-              {data.config.maxSecSinceTrough}sn, midSlope {data.config.requireMidSlope ? 'şart' : 'opsiyonel'} ·
+              <strong>Multi-TF Dönüş:</strong> coin düştü (son 10dk ≥%0.4) + toparlanma TAM DÖNÜŞ
+              anında (recovery %{data.config.minRecoveryFromLowPct}–0.40, ne erken ne geç) → 1dk + 3dk
+              + 10dk pencereleri AYNI ANDA pozitif → 30dk bandı -%0.5…+%1.5 (ne dead-cat ne tepe) → giriş.
+              <em> (Eşikler 2.7 günlük Binance backtest ile optimize edildi — kritik faktör giriş zamanlaması.)</em> Binance native
+              trailing ile çıkış, hard-stop koruması. Risk-off/downtrend&apos;de kapalı ·
               trailing {data.config.trailingActivationPct}/{data.config.trailingCallbackPct}% ·
               hard-stop %{data.config.hardStopPct} · otomatik alım rejime göre (adapt) · manuel{' '}
               {data.adapt.manualBuyQuoteUsdt} USDT.
             </p>
 
-            <Section title={`Alınan coinler (${data.positions.length})`}>
+            <Section title={`Açık pozisyonlar (${data.positions.length})`}>
               {data.positions.length === 0 ? (
-                <p className="px-3 py-4 text-sm text-slate-500">Henüz alım yok.</p>
+                <p className="px-3 py-4 text-sm text-slate-500">
+                  Şu an açık pozisyon yok.
+                  {data.totals.tradesToday > 0
+                    ? ` Bugün ${data.totals.tradesToday} işlem kapandı — aşağıdaki "Bugün alınan / kapanan işlemler" bölümüne bak.`
+                    : ''}
+                </p>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-sm">
@@ -901,24 +948,23 @@ export default function DipReversalPage() {
                           nowPct={nowPct}
                         />
                         <FlashDropCell value={c.flashDrop3mPct} />
-                        <GateCell value={c.windowDropPct} ok={gatePass(c, 'capitulation')} suffix="%" />
-                        <ChangeCell value={c.change1mPct} />
-                        <ChangeCell value={c.change3mPct} />
-                        <ChangeCell value={c.change10mPct} />
-                        <ChangeCell value={c.change30mPct} />
-                        <GateCell value={c.wsDeclinePct} ok={gatePass(c, 'ws_decline')} suffix="%" />
+                        <GateCell value={c.windowDropPct} ok={gatePass(c, 'min_drop')} suffix="%" />
+                        {/* Multi-TF dönüş kapıları: 1/3/10dk pozitif + 30dk tepe filtresi */}
+                        <GateCell value={c.change1mPct} ok={gatePass(c, 'tf_1m')} suffix="%" />
+                        <GateCell value={c.change3mPct} ok={gatePass(c, 'tf_3m')} suffix="%" />
+                        <GateCell value={c.change10mPct} ok={gatePass(c, 'tf_10m')} suffix="%" />
+                        <GateCell value={c.change30mPct} ok={gatePass(c, 'not_extended')} suffix="%" />
+                        <ChangeCell value={c.wsDeclinePct} />
                         <GateCell
                           value={c.recoveryFromWsLowPct}
-                          ok={gatePass(c, 'recovery')}
+                          ok={gatePass(c, 'prior_dip')}
                           suffix="%"
                           digits={3}
                         />
                         <GateCell value={c.reversalScore} ok={gatePass(c, 'reversal_score')} digits={2} />
-                        <GateCell
-                          value={c.secSinceTrough}
-                          ok={gatePass(c, 'trough_recency')}
-                          digits={0}
-                        />
+                        <td className="px-2 py-2 text-slate-400">
+                          {c.secSinceTrough != null ? c.secSinceTrough.toFixed(0) : '—'}
+                        </td>
                         <td className="px-2 py-2">
                           <span className={c.midSlopeOk ? 'text-emerald-400' : 'text-slate-500'}>
                             {c.midSlopeOk ? '↑' : '↓'}
@@ -955,7 +1001,7 @@ export default function DipReversalPage() {
 
             <section>
               <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-                <h2 className="text-lg font-medium">Bugün realize (dip reversal)</h2>
+                <h2 className="text-lg font-medium">Bugün alınan / kapanan işlemler</h2>
                 <span className="text-sm text-slate-400">
                   {data.totals.tradesToday} işlem ·{' '}
                   <span className={pnlTone(data.totals.realizedPnlToday)}>
@@ -1001,7 +1047,7 @@ export default function DipReversalPage() {
 
             <Section title="Son aktivite">
               {data.recent.length === 0 ? (
-                <p className="px-3 py-4 text-sm text-slate-500">Henüz dip_reversal olayı yok.</p>
+                <p className="px-3 py-4 text-sm text-slate-500">Henüz işlem olayı yok.</p>
               ) : (
                 <ul className="divide-y divide-slate-800 text-sm">
                   {data.recent.map((a, i) => (

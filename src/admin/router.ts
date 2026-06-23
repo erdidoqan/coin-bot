@@ -7,8 +7,10 @@ import {
 import {
   listAllConfig,
   setConfigs,
+  setConfig,
   getConfig,
   getTickScalpConfig,
+  isAutoStrategyEnabled,
   type BotConfigKey,
 } from '../db/bot-config';
 import { effectiveRecoveryMinPct } from '../indicators/tick-reversal';
@@ -452,6 +454,18 @@ export async function handleAdminApi(request: Request, env: Env): Promise<Respon
     if (path === '/actions/force-close' && request.method === 'POST') {
       const result = await runForceClose(env);
       return jsonResponse(request, result, result.ok ? 200 : 500);
+    }
+
+    // Auto Strateji master aç/kapa. enabled=false → tüm yeni girişler durur
+    // (açık pozisyon yönetimi/reconcile sürer).
+    if (path === '/actions/auto-strategy' && request.method === 'GET') {
+      return jsonResponse(request, { enabled: await isAutoStrategyEnabled(env.DB, env) });
+    }
+    if (path === '/actions/auto-strategy' && request.method === 'POST') {
+      const body = (await request.json()) as { enabled?: boolean };
+      const enabled = body.enabled === true;
+      await setConfig(env.DB, 'auto_strategy_enabled', enabled ? 'true' : 'false');
+      return jsonResponse(request, { ok: true, enabled });
     }
 
     return jsonResponse(request, { error: 'Not found' }, 404);

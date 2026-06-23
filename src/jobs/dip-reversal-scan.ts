@@ -125,6 +125,10 @@ async function enrichKlinesInParallel(
             reversalScore: prev.reversalScore,
             secSinceTrough: prev.secSinceTrough,
             midSlopeOk: prev.midSlopeOk,
+            change1mPct: metrics.change1mPct,
+            change3mPct: metrics.change3mPct,
+            change10mPct: metrics.change10mPct,
+            change30mPct: metrics.change30mPct,
           },
           thr,
         );
@@ -141,12 +145,16 @@ async function enrichKlinesInParallel(
   }
 }
 
+/** Aynı coine günde max giriş (overtrading limiti — NEAR×8 sorunu). */
+const DIP_DAILY_ENTRY_LIMIT = 2;
+
 export type DipReversalExclusion =
   | 'system_blocked'
   | 'no_mid'
   | 'grid'
   | 'open_position'
   | 'cooldown'
+  | 'daily_limit'
   | null;
 
 export type DipReversalPanelMode = 'live' | 'full';
@@ -220,9 +228,13 @@ export async function dipReversalCooldownSymbols(
   if (minutes <= 0) return new Set();
   const { results } = await db
     .prepare(
+      // dip_reversal kapanışları + rotation/hard_stop ile satılanlar da cooldown'a girsin
+      // (rotation kapanışı entry_mode taşımıyor → testere'yi önlemek için source bazlı da yakala).
       `SELECT payload FROM trade_log
        WHERE event_type = 'POSITION_CLOSED'
-         AND payload LIKE '%"entry_mode":"dip_reversal"%'
+         AND (payload LIKE '%"entry_mode":"dip_reversal"%'
+              OR payload LIKE '%rotation%'
+              OR payload LIKE '%hard_stop%')
          AND created_at >= datetime('now', ?)
        ORDER BY id DESC LIMIT 200`,
     )
@@ -243,6 +255,31 @@ export async function dipReversalCooldownSymbols(
 export async function dipReversalOpenSymbols(db: D1Database): Promise<Set<string>> {
   const rows = await listOpenPositions(db, { entryMode: 'dip_reversal' });
   return new Set(rows.map((p) => p.symbol));
+}
+
+/** Bugün (TR günü) >= maxPerDay kez ALIM yapılmış semboller → overtrading limiti.
+ *  Aynı coine gün boyu defalarca girip zarar etmeyi önler (NEAR×8 sorunu). */
+export async function dailyEntryLimitSymbols(
+  db: D1Database,
+  maxPerDay: number,
+): Promise<Set<string>> {
+  if (maxPerDay <= 0) return new Set();
+  const { results } = await db
+    .prepare(
+      `SELECT json_extract(payload, '$.symbol') AS sym, COUNT(*) AS n
+       FROM trade_log
+       WHERE event_type = 'BUY_FILLED'
+         AND created_at >= datetime(date('now', '+3 hours'), '-3 hours')
+       GROUP BY sym
+       HAVING n >= ?1`,
+    )
+    .bind(maxPerDay)
+    .all<{ sym: string | null; n: number }>();
+  const out = new Set<string>();
+  for (const r of results ?? []) {
+    if (r.sym) out.add(r.sym);
+  }
+  return out;
 }
 
 /** Tek sembol cooldown (test / nadir kullanım). */
@@ -328,9 +365,10 @@ export async function scanDipReversalCandidates(
   if (!rank || rank.rows.length === 0) return { rows: [], adapt: null };
 
   const { thr, adapt } = resolveScanThresholds(cfg, opts.adaptSnapshot);
-  const [openSymbols, cooldownSymbols] = await Promise.all([
+  const [openSymbols, cooldownSymbols, dailyLimitSymbols] = await Promise.all([
     dipReversalOpenSymbols(env.DB),
     dipReversalCooldownSymbols(env.DB, cfg.postExitCooldownMin),
+    dailyEntryLimitSymbols(env.DB, DIP_DAILY_ENTRY_LIMIT),
   ]);
   const flashBars = Math.max(3, Math.ceil(cfg.flashWindowMin / 5) + 1);
 
@@ -354,6 +392,7 @@ export async function scanDipReversalCandidates(
     else if (!row.mid || !bn(row.mid).gt(0)) excluded = 'no_mid';
     else if (openSymbols.has(symbol)) excluded = 'open_position';
     else if (cooldownSymbols.has(symbol)) excluded = 'cooldown';
+    else if (dailyLimitSymbols.has(symbol)) excluded = 'daily_limit';
 
     const prePass = reversalPrePass(row, wsDecline, recovery, thr);
     prePassBySymbol.set(symbol, prePass);
@@ -390,6 +429,11 @@ export async function scanDipReversalCandidates(
         reversalScore: row.reversalScore,
         secSinceTrough: row.secSinceTrough,
         midSlopeOk: row.midSlopeOk,
+        // prepass: kline metrics henüz yok → multi-TF eligible olamaz (doğru).
+        change1mPct: null,
+        change3mPct: null,
+        change10mPct: null,
+        change30mPct: null,
       },
       thr,
     );

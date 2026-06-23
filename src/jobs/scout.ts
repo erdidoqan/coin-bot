@@ -7,7 +7,7 @@ import {
   isHybridEnabled,
   isMicroScalpEnabled,
   isTickScalpEnabled,
-  isStrategyAutoMode,
+  isAutoStrategyEnabled,
   getMicroScalpConfig,
   getTickScalpConfig,
   getScoutTickConfig,
@@ -32,7 +32,7 @@ import {
 export async function runScout(env: Env): Promise<void> {
   try {
     const stableMaxVolatilityPct = await getConfig(env.DB, 'stable_max_volatility_pct', env);
-    const autoMode = await isStrategyAutoMode(env.DB, env);
+    const autoMode = await isAutoStrategyEnabled(env.DB, env);
     const tickEnabled = !autoMode && (await isTickScalpEnabled(env.DB, env));
     const microScalpEnabled = !autoMode && (await isMicroScalpEnabled(env.DB, env));
     const microEnabled = microScalpEnabled || tickEnabled;

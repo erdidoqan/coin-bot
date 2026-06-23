@@ -152,12 +152,15 @@ export async function createOpenPosition(
   return created;
 }
 
-export async function removeOpenPosition(db: D1Database, id: number): Promise<void> {
-  await db
+/** Pozisyonu siler. changes>0 ise gerçekten silindi (bu çağrı "sahiplendi"); false ise
+ *  zaten silinmişti (başka reconcile turu işlemiş) → çift-işleme guard için kullanılır. */
+export async function removeOpenPosition(db: D1Database, id: number): Promise<boolean> {
+  const res = await db
     .prepare('DELETE FROM open_positions WHERE id = ?')
     .bind(id)
     .run();
   await syncPrimaryBotStateFromOpenPositions(db);
+  return (res.meta?.changes ?? 0) > 0;
 }
 
 export async function clearAllOpenPositions(db: D1Database): Promise<void> {
